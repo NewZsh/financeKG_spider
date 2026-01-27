@@ -2,7 +2,10 @@ import os
 import json
 import threading
 import time
-import fcntl  # 文件锁支持
+try:
+    import fcntl  # 文件锁支持 (Unix only)
+except ImportError:
+    fcntl = None
 from datetime import datetime
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
