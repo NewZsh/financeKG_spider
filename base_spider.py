@@ -2,6 +2,8 @@ import os
 import json
 import threading
 import time
+import sqlite3
+
 try:
     import fcntl  # 文件锁支持 (Unix only)
 except ImportError:
@@ -30,6 +32,49 @@ class base_spider:
         self.__load_cfg()
         self.__start_cfg_refresh_timer()
 
+        ## 用sql管理爬虫进展
+        ## sql维护两个表，一个是record（已经爬过的记录），一个是todo（待爬取的记录）
+        ## record表结果：src, id, entity_type, visit_time(YYYY-MM-DD), last_visit_time, visit_times
+        ## todo表结果：src, id, entity_type, found_time
+        self.db_file = "data/spider_progress.db"
+        self.db_file =  os.path.join(cur_dir, self.db_file)
+        self.__init_db()
+
+    def __init_db(self):
+        '''
+        初始化数据库和表
+        '''
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # 创建record表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS record (
+                src TEXT,
+                id TEXT,
+                entity_type TEXT,
+                visit_time TEXT,
+                last_visit_time TEXT,
+                visit_times INTEGER,
+                PRIMARY KEY (src, id)
+            )
+        ''')
+        
+        # 创建todo表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS todo (
+                src TEXT,
+                id TEXT,
+                entity_type TEXT,
+                found_time TEXT,
+                PRIMARY KEY (src, id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()    
+
+    ## ** PART 1 : 配置管理相关函数 ** ##
     def __load_cfg(self):
         '''
         Load configuration from cfg file
@@ -95,111 +140,7 @@ class base_spider:
         self.__start_cfg_refresh_timer()
         print(f"配置刷新间隔已设置为: {interval}秒")
 
-    # 小批量更新相关方法
-    def add_to_update_buffer(self, record_data):
-        """
-        添加记录到更新缓冲区
-        Args:
-            record_data: 记录数据字典，包含id, name, type等信息
-        """
-        with self.buffer_lock:
-            self.update_buffer.append(record_data)
-            
-            # 如果缓冲区达到批量大小，立即执行更新
-            if len(self.update_buffer) >= self.batch_size:
-                self._flush_buffer()
-    
-    def _flush_buffer(self):
-        """将缓冲区数据写入文件"""
-        if not self.update_buffer:
-            return
-            
-        with self.file_lock:
-            try:
-                # 读取现有文件内容
-                existing_data = {}
-                if os.path.exists(self.id_file_snapshot):
-                    with open(self.id_file_snapshot, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            if line.strip() and not line.startswith('#'):
-                                parts = line.strip().split('\t')
-                                if len(parts) >= 1:
-                                    existing_data[parts[0]] = line.strip()
-                
-                # 更新或添加新记录
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                for record in self.update_buffer:
-                    record_id = str(record.get('id', ''))
-                    if record_id:
-                        # 构建记录行
-                        name = record.get('name', '')
-                        record_type = record.get('type', '')
-                        
-                        # 如果记录已存在，更新last_spider_time；否则创建新记录
-                        if record_id in existing_data:
-                            existing_line = existing_data[record_id]
-                            parts = existing_line.split('\t')
-                            if len(parts) >= 5:
-                                # 更新最后爬取时间
-                                new_line = f"{record_id}\t{name}\t{record_type}\t{parts[3]}\t{current_time}"
-                            else:
-                                new_line = f"{record_id}\t{name}\t{record_type}\t{current_time}\t{current_time}"
-                        else:
-                            new_line = f"{record_id}\t{name}\t{record_type}\t{current_time}\t{current_time}"
-                        
-                        existing_data[record_id] = new_line
-                
-                # 写回文件
-                with open(self.id_file_snapshot, 'w', encoding='utf-8') as f:
-                    f.write("# 公司ID历史记录文件\n")
-                    f.write("# 格式: id \\t name \\t type \\t spider_time \\t last_spider_time\n\n")
-                    for record_line in existing_data.values():
-                        f.write(record_line + '\n')
-                
-                print(f"批量更新完成，处理了 {len(self.update_buffer)} 条记录")
-                
-                # 清空缓冲区
-                self.update_buffer.clear()
-                
-            except Exception as e:
-                print(f"文件更新失败: {e}")
-    
-    def set_batch_size(self, size):
-        """设置批量大小"""
-        self.batch_size = size
-        print(f"批量大小设置为: {size}")
-    
-    def force_flush(self):
-        """强制刷新缓冲区"""
-        with self.buffer_lock:
-            if self.update_buffer:
-                self._flush_buffer()
-    
-    def get_stats(self):
-        """获取统计信息（不干扰爬虫操作）"""
-        with self.file_lock:
-            try:
-                if not os.path.exists(self.id_file_snapshot):
-                    return {"total_records": 0, "last_updated": None}
-                
-                with open(self.id_file_snapshot, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                
-                # 过滤注释行和空行
-                data_lines = [line for line in lines if line.strip() and not line.startswith('#')]
-                
-                stats = {
-                    "total_records": len(data_lines),
-                    "buffer_size": len(self.update_buffer),
-                    "last_updated": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                
-                return stats
-                
-            except Exception as e:
-                print(f"获取统计信息失败: {e}")
-                return {"error": str(e)}
-
+    ## ** PART 2 : 代理管理相关函数 ** ##
     def __get_proxy(self, proxy = None):
         '''
         TODO: get proxy from proxy pool
@@ -211,3 +152,58 @@ class base_spider:
             "http": f"http://{proxy}",
             "https": f"http://{proxy}",
         }
+
+    ## ** PART 3 : 相关统计函数 ** ##
+    def __get_stats(self):
+        '''
+        获取统计信息
+        '''
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # 获取record表中的记录数
+        cursor.execute("SELECT COUNT(*) FROM record")
+        record_count = cursor.fetchone()[0]
+
+        # 分src / entity_type统计
+        cursor.execute("SELECT src, entity_type, COUNT(*) FROM record GROUP BY src, entity_type")
+        record_stats = {}
+        for src, entity_type, count in cursor.fetchall():
+            if src not in record_stats:
+                record_stats[src] = {}
+            record_stats[src][entity_type] = count
+        
+        # 获取todo表中的记录数
+        cursor.execute("SELECT COUNT(*) FROM todo")
+        todo_count = cursor.fetchone()[0]
+
+        # 分src / entity_type统计
+        cursor.execute("SELECT src, entity_type, COUNT(*) FROM todo GROUP BY src, entity_type")
+        todo_stats = {}
+        for src, entity_type, count in cursor.fetchall():
+            if src not in todo_stats:
+                todo_stats[src] = {}
+            todo_stats[src][entity_type] = count
+
+        # 时效性统计（7天，7-30天，30-90天，90天以上）
+        time_frames = {"7_days": 7, "7_30_days": 30, "30_90_days": 90, "90_plus_days": 3650}
+        now = datetime.now()
+        record_timeframe_stats = {}
+        for key, days in time_frames.items():
+            cursor.execute(f'''
+                SELECT COUNT(*) FROM record 
+                WHERE julianday(?) - julianday(visit_time) <= ?
+            ''', (now.strftime('%Y-%m-%d'), days))
+            count = cursor.fetchone()[0]
+            record_timeframe_stats[key] = count
+        
+        conn.close()
+        
+        return {
+            "record_count": record_count,
+            "todo_count": todo_count,
+            "record_stats": record_stats,
+            "todo_stats": todo_stats,
+            "record_timeframe_stats": record_timeframe_stats
+        }
+
