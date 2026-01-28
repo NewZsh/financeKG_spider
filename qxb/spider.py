@@ -8,6 +8,7 @@ import aiohttp
 import asyncio
 import os
 import time
+import random
 from datetime import datetime
 import threading
 import requests
@@ -26,59 +27,28 @@ class QXBSpider(base_spider):
         super().__init__()
 
         self.s_cfg = self.cfg[self.__class__.__name__]
-
-        # id \t name \t type \t spider_time \t last_spider_time
-        self.id_file_snapshot = self.s_cfg["id_file_snapshot"]
-        if not os.path.exists(self.id_file_snapshot):
-            os.makedirs(os.path.dirname(self.id_file_snapshot), exist_ok=True)
-            open(self.id_file_snapshot, 'w').close() 
         
-        # 统计相关
-        self.stats_data = {
-            "total_crawled": 0,
-            "success_count": 0,
-            "error_count": 0,
-            "last_crawl_time": None,
-            "current_batch_size": 0
-        }
-        self.stats_lock = threading.Lock()
+        # 初始化Session，保持会话和复用连接
+        self.session = requests.Session()
+        self.session.headers.update(self.get_headers())
     
-    def stats(self):
-        """
-        获取爬虫统计信息（不干扰爬虫操作）
-        """
-        with self.stats_lock:
-            file_stats = self.get_stats()
-            
-            stats_info = {
-                "文件统计": file_stats,
-                "爬虫运行统计": self.stats_data.copy(),
-                "缓冲区状态": {
-                    "当前缓冲区大小": len(self.update_buffer),
-                    "批量大小设置": self.batch_size
-                },
-                "配置信息": {
-                    "配置刷新间隔": f"{self.refresh_interval}秒",
-                    "最后配置加载": time.strftime('%Y-%m-%d %H:%M:%S')
-                }
-            }
-            
-            return stats_info
-    
-    def update_crawl_stats(self, success=True):
-        """更新爬虫统计"""
-        with self.stats_lock:
-            self.stats_data["total_crawled"] += 1
-            if success:
-                self.stats_data["success_count"] += 1
-            else:
-                self.stats_data["error_count"] += 1
-            self.stats_data["last_crawl_time"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            self.stats_data["current_batch_size"] = len(self.update_buffer)
-
     def get_headers(self):
+        """
+        获取完整的请求头（模拟Mac Chrome真实请求头）
+        核心思路：模拟真人浏览器的请求特征，降低被检测的概率
+        """
         return {
-            "User-Agent": self.ua_list[0]
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.qixin.com/",  # 来源页，模拟从首页跳转
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Connection": "keep-alive"
         }
 
     def get_company_info_byID(self, company_id):
@@ -90,9 +60,17 @@ class QXBSpider(base_spider):
             url = f"{self.s_cfg['base_url']}company/{company_id}"
             print(f"正在爬取公司ID: {company_id}, URL: {url}")
             
-            # 发送HTTP请求
-            headers = self.get_headers()
-            response = requests.get(url, headers=headers, timeout=30)
+            # 随机延迟（1-3秒），模拟真人操作间隔
+            delay = random.uniform(1, 3)
+            print(f"等待 {delay:.2f} 秒...")
+            time.sleep(delay)
+            
+            # 使用Session发送请求（复用连接和Cookie，允许重定向）
+            response = self.session.get(
+                url,
+                timeout=10,
+                allow_redirects=True
+            )
             response.raise_for_status()
             
             # 解析HTML
@@ -235,6 +213,15 @@ class QXBSpider(base_spider):
         
         return search_results
     
+    def close_session(self):
+        """
+        关闭Session，释放连接资源
+        在爬取完成后调用，确保资源正确释放
+        """
+        if self.session:
+            self.session.close()
+            print("Session已关闭，资源已释放")
+    
     def crawl_companies_batch(self, company_ids, batch_size=50):
         """
         批量爬取公司信息
@@ -261,8 +248,11 @@ class QXBSpider(base_spider):
                     progress = (i + 1) / total_count * 100
                     print(f"进度: {i + 1}/{total_count} ({progress:.1f}%)")
                 
-                # 小批量延迟，避免过快请求
-                time.sleep(0.1)
+                # 批次间随机延迟（每10条增加更长延迟，避免连续快速请求）
+                if (i + 1) % 10 == 0:
+                    batch_delay = random.uniform(5, 8)
+                    print(f"批次间隔延迟 {batch_delay:.2f} 秒...")
+                    time.sleep(batch_delay)
                 
             except Exception as e:
                 print(f"爬取公司 {company_id} 失败: {e}")
