@@ -11,6 +11,19 @@ except ImportError:
 from datetime import datetime
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
+from loguru import logger
+
+# configure loguru to write to a file with desired format
+log_file = os.path.join(cur_dir, "logs", "spider.log")
+os.makedirs(os.path.dirname(log_file), exist_ok=True)
+logger.remove()
+logger.add(
+    log_file,
+    rotation="10 MB",
+    retention="10 days",
+    level="INFO",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {file}:{line} - {message}",
+)
 
 class base_spider:
     def __init__(self):
@@ -28,6 +41,9 @@ class base_spider:
         self.update_buffer = []  # 更新缓冲区
         self.buffer_lock = threading.Lock()  # 缓冲区锁
         self.file_lock = threading.Lock()  # 文件锁
+
+        # bind a loguru logger to this instance
+        self.logger = logger.bind(spider=self.__class__.__name__)
 
         self.__load_cfg()
         self.__start_cfg_refresh_timer()
@@ -81,9 +97,9 @@ class base_spider:
         '''
         try:
             self.cfg = json.loads(open(self.cfg_file, 'r').read())
-            print(f"配置加载成功，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.logger.info(f"配置加载成功，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception as e:
-            print(f"配置加载失败: {e}")
+            self.logger.exception(f"配置加载失败: {e}")
 
     # cfg 允许热更，更新参数直接作用于爬虫后台而无需重启
     def __refresh_cfg(self):
@@ -109,7 +125,7 @@ class base_spider:
         self.timer = threading.Timer(self.refresh_interval, self.__cfg_refresh_cycle)
         self.timer.daemon = True  # 设置为守护线程，主程序退出时自动结束
         self.timer.start()
-        print(f"配置自动刷新定时器已启动，间隔: {self.refresh_interval}秒")
+        self.logger.info(f"配置自动刷新定时器已启动，间隔: {self.refresh_interval}秒")
     
     def __cfg_refresh_cycle(self):
         '''
@@ -118,7 +134,7 @@ class base_spider:
         try:
             self.__refresh_cfg()
         except Exception as e:
-            print(f"配置刷新失败: {e}")
+            self.logger.exception(f"配置刷新失败: {e}")
         
         # 重新启动定时器
         self.__start_cfg_refresh_timer()
@@ -130,7 +146,7 @@ class base_spider:
         if self.timer:
             self.timer.cancel()
             self.timer = None
-            print("配置自动刷新已停止")
+            self.logger.info("配置自动刷新已停止")
     
     def set_refresh_interval(self, interval):
         '''
@@ -138,7 +154,7 @@ class base_spider:
         '''
         self.refresh_interval = interval
         self.__start_cfg_refresh_timer()
-        print(f"配置刷新间隔已设置为: {interval}秒")
+        self.logger.info(f"配置刷新间隔已设置为: {interval}秒")
 
     ## ** PART 2 : 代理管理相关函数 ** ##
     def __get_proxy(self, proxy = None):
