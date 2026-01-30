@@ -170,6 +170,34 @@ class base_spider:
         }
 
     ## ** PART 3 : 相关统计函数 ** ##
+    def write_db(self, src, id, entity_type, visit_time, last_visit_time, visit_times):
+        '''
+        写入数据库
+        
+        如果第一次访问，last_visit_time 设置为 visit_time，visit_times 设置为 1
+        '''
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+
+        # 检查记录是否存在，存在的话，time_str --> visit_time, visit_time --> last_visit_time, visit_times --> visit_times + 1
+        cursor.execute('''
+            SELECT COUNT(*) FROM record WHERE src=? AND id=?
+        ''', (src, id))
+        exists = cursor.fetchone()[0] > 0
+        if exists:
+            cursor.execute('''
+                UPDATE record SET visit_time=?, last_visit_time=?, visit_times=visit_times+1 WHERE src=? AND id=?
+            ''', (time_str, visit_time, src, id))
+        else:
+            cursor.execute('''
+                INSERT INTO record (src, id, entity_type, visit_time, last_visit_time, visit_times)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (src, id, entity_type, visit_time, last_visit_time, visit_times))
+        conn.commit()
+        conn.close()
+        
     def __get_stats(self):
         '''
         获取统计信息
