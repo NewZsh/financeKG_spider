@@ -66,7 +66,7 @@ pip install requests loguru flask werkzeug
 
 ### 2. 启动仪表板
 ```bash
-python run.py
+python spider_dashboard.py
 ```
 访问 `http://localhost:5000`
 
@@ -75,16 +75,10 @@ python run.py
 - 上传 `.txt` 文件（UTF-8 编码，每行一个）
 - 支持拖拽上传，可下载示例文件
 
-### 4. 开始搜索
-- 访问 `/tyc/search`
-- 配置最大爬取页数（可选）
-- 点击"搜索"，实时显示进度
-
 ## 📁 项目结构
 
 ```
-├── run.py                        # 启动脚本
-├── spider_dashboard.py           # Web 仪表板（关键词管理+搜索）
+├── spider_dashboard.py           # 启动脚本：Web 仪表板（关键词管理+搜索）
 ├── tyc/spider.py                 # 天眼查爬虫（搜索+投资信息）
 ├── base_spider.py                # 基础爬虫类
 ├── spider.cfg                    # 爬虫配置
@@ -130,7 +124,6 @@ python run.py
 | `/` | 首页导航 |
 | `/tyc/keywords` | 关键词管理页面 |
 | `/tyc/keywords/api` | 获取关键词列表 API |
-| `/tyc/search` | 搜索公司页面 |
 
 ### 关键词文件要求
 - **格式**：`.txt` 纯文本
@@ -148,9 +141,13 @@ CVTE
 小米
 ```
 
-## 🐍 天眼查——命令行使用
+## 🐍 爬虫细节
 
-### 搜索公司
+### 1. 天眼查
+
+#### 1.1 命令行使用
+
+- 搜索公司
 ```python
 from tyc.spider import TYCSpider
 
@@ -160,22 +157,22 @@ print(f"找到 {result['total_companies']} 家公司")
 spider.close_session()
 ```
 
-### 爬取投资信息
+- 爬取投资信息
 ```python
 spider = TYCSpider()
 investments = spider.get_all_investment("1391758803", save_to_file=True)
 spider.close_session()
 ```
 
-### 运行测试
+- 运行测试
 ```bash
 python -m tyc.spider -t search      # 测试搜索
 python -m tyc.spider -t investment  # 测试投资爬取
 ```
 
-## 📝 数据存储
+#### 1.2 数据存储
 
-### 公司基本信息 (base_info_{id}.json)
+- 公司基本信息 (base_info_{id}.json)
 ```json
 {
     "id": "3478715717",
@@ -188,12 +185,12 @@ python -m tyc.spider -t investment  # 测试投资爬取
 ```
 位置：`data/tyc_data/base_info_{id}.json`
 
-### 投资信息 (investments_{company_gid}.json)
+- 投资信息 (investments_{company_gid}.json)
 位置：`data/tyc_data/investments_{company_gid}.json`
 
-## 📖 API 返回格式
+#### 1.3 API 返回格式
 
-### 搜索结果
+- 搜索结果
 ```python
 {
     "keyword": "CVTE",
@@ -204,7 +201,7 @@ python -m tyc.spider -t investment  # 测试投资爬取
 }
 ```
 
-### 关键词列表 API
+- 关键词列表 API
 ```python
 {
     "exists": true,

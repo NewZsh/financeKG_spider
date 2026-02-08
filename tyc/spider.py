@@ -11,11 +11,13 @@ import time
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 import uuid
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.dirname(cur_dir))
+# back to main directory
+cur_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(cur_dir)
 
 from base_spider import base_spider
 
@@ -94,8 +96,8 @@ class TYCSpider(base_spider):
         Returns:
             dict: 请求体
         """
-        # 根据用户提供的API请求格式构建
-        session_no = f"{int(time.time())}.{str(uuid.uuid4())[:8]}"
+        # 根据用户提供的API请求格式构建，小数点后8位，补0
+        session_no = f"{time.time()}0"
         
         filter_json = {
             "economicTypeMethod": {
@@ -272,7 +274,122 @@ class TYCSpider(base_spider):
             company_ids.append(company_id)
         
         return company_ids
+    
+    def get_all_shareholder(self, company_gid, save_to_file=False):
+        """
+        获取公司的所有股东信息（自动处理分页）
+        Args:
+            company_gid: 公司 ID
+            save_to_file: 是否保存到文件
+        
+        Returns:
+            list: 所有股东记录的公司ID列表
+        """
+        if not self.headers_is_valid:
+            self.logger.warning("请求头无效，暂停请求")
+            raise Exception("请求头无效，暂停请求")
 
+        output_file_main = os.path.join(self.data_direc, f"shareholders_{company_gid}.json")
+        if os.path.exists(output_file_main):
+            self.logger.info(f"数据文件 {output_file_main} 已存在，跳过爬取")
+            return
+
+        self.logger.info(f"========== 开始爬取公司 {company_gid} 的股东信息 ==========")
+
+        page_num = 1
+        page_size = 50
+        parsed_cnt = 0
+        sleep_seconds = self.get_request_sleep_seconds()
+
+        failure_count = 0
+        gid_found = set()
+        hid_found = set()
+
+        url = "https://capi.tianyancha.com/cloud-company-background/companyV2/dim/holder/latest/announcement"
+
+        while True:
+            if page_num > 1:
+                self.logger.info(f"等待 {sleep_seconds} 秒后发送下一个请求...")
+                time.sleep(sleep_seconds)
+
+            payload = {
+                "gid": str(company_gid),
+                "pageSize": page_size,
+                "pageNum": page_num,
+                "historyType": None,
+                "benefitSharesType": 1,
+                "_unUseParam": 0
+            }
+
+            try:
+                response = self.session.post(url, json=payload, timeout=15, allow_redirects=True)
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.RequestException as e:
+                self.logger.exception(f"网络请求失败: {e}")
+                failure_count += 1
+                if failure_count >= self.headers_trial_limit:
+                    self.logger.error("连续多次请求失败，请求头设置为无效，等待人工干预")
+                    self.headers_is_valid = False
+                break
+            except json.JSONDecodeError as e:
+                self.logger.exception(f"JSON 解析失败: {e}")
+                break
+
+            # 检查返回状态
+            if data.get("state") != "ok":
+                self.logger.error(f"API 返回错误: {data.get('message', 'Unknown error')}")
+                failure_count += 1
+                if failure_count >= self.headers_trial_limit:
+                    self.logger.error("连续多次请求失败，请求头设置为无效，等待人工干预")
+                    self.headers_is_valid = False
+                break
+
+            failure_count = 0
+
+            page_data = data.get("data") or {}
+            shareholders = page_data.get("result")
+            total = page_data.get("total")
+
+            if not shareholders:
+                self.logger.info(f"第 {page_num} 页无股东记录，停止爬取")
+                break
+
+            # 可选：保存到文件（仅在本页有记录时写入，避免创建空文件）
+            if save_to_file:
+                output_file = os.path.join(self.data_direc, f"shareholders_{company_gid}.json")
+                with open(output_file, 'a', encoding='utf-8') as f:
+                    for shareholder in shareholders:
+                        f.write(json.dumps(shareholder, ensure_ascii=False) + "\n")
+
+            self.logger.info(f"第 {page_num} 页获取 {len(shareholders)} 条记录，总共 {total} 条")
+
+            for shareholder in shareholders:
+                # 找到股东ID，注意区分企业股东和自然人股东
+                hid = shareholder.get("shareHolderHid")
+                gid = shareholder.get("shareHolderGid")
+
+                if hid == gid: # 企业股东
+                    gid_found.add(gid)
+                else: 
+                    # 天眼查的自然人股东的id规则是  {hid}-c{gid} 防止人名相同时候无法区分
+                    # 对于实际是同一个人控股两个公司 {hid}-c{gid1} 等价 {hid}-c{gid2}
+                    hid = f"{hid}-c{gid}"
+                    hid_found.add(hid)
+
+            # 检查是否需要继续分页
+            parsed_cnt += len(shareholders)
+            if parsed_cnt >= total:
+                self.logger.info(f"所有 {total} 条记录已获取完毕")
+                break
+
+            page_num += 1
+            if page_num > 1000:
+                self.logger.warning("页码超过限制，停止爬取")
+                break
+
+        return list(gid_found), list(hid_found)
+    
     def get_all_investment(self, company_gid, save_to_file=False):
         """
         获取公司的所有对外投资信息（自动处理分页）
@@ -292,7 +409,7 @@ class TYCSpider(base_spider):
             self.logger.info(f"数据文件 {output_file} 已存在，跳过爬取")
             return
 
-        self.logger.info(f"\n========== 开始爬取公司 {company_gid} 的对外投资信息 ==========")
+        self.logger.info(f"========== 开始爬取公司 {company_gid} 的对外投资信息 ==========")
         
         page_num = 1
         page_size = 100
@@ -327,22 +444,23 @@ class TYCSpider(base_spider):
                         
             # 解析数据
             investments, company_base_info_dict = self.__parse_investment_data(investments)
+
+            if not investments:
+                self.logger.info(f"第 {page_num} 页无投资记录，停止爬取")
+                break
                     
             # 可选：保存到文件（仅在本页有记录时写入，避免创建空文件）
             if save_to_file:
-                if investments:
-                    output_file = os.path.join(self.data_direc, f"investments_{company_gid}.json")
-                    with open(output_file, 'a', encoding='utf-8') as f:
-                        for inv in investments:
-                            f.write(json.dumps(inv, ensure_ascii=False) + "\n")
-                    for id, base_info in company_base_info_dict.items():
-                        id_found.add(id)
-                        output_file = os.path.join(self.data_direc, f"base_info_{id}.json")
-                        if not os.path.exists(output_file):
-                            with open(output_file, 'w', encoding='utf-8') as f:
-                                f.write(json.dumps(base_info, ensure_ascii=False) + "\n")
-                else:
-                    self.logger.info(f"第 {page_num} 页无投资记录，跳过文件写入")
+                output_file = os.path.join(self.data_direc, f"investments_{company_gid}.json")
+                with open(output_file, 'a', encoding='utf-8') as f:
+                    for inv in investments:
+                        f.write(json.dumps(inv, ensure_ascii=False) + "\n")
+                for id, base_info in company_base_info_dict.items():
+                    id_found.add(id)
+                    output_file = os.path.join(self.data_direc, f"base_info_{id}.json")
+                    if not os.path.exists(output_file):
+                        with open(output_file, 'w', encoding='utf-8') as f:
+                            f.write(json.dumps(base_info, ensure_ascii=False) + "\n")
 
             self.logger.info(f"第 {page_num} 页获取 {len(investments)} 条记录，总共 {total} 条")
             
@@ -380,8 +498,14 @@ class TYCSpider(base_spider):
         if not self.headers_is_valid:
             self.logger.warning("请求头无效，暂停请求")
             raise Exception("请求头无效，暂停请求")
+    
+        # 如果没有会员，只能看前两页
+        if not max_page:
+            max_page = 2
+        elif max_page > 2:
+            max_page = 2
         
-        self.logger.info(f"\n========== 开始搜索关键字: {keyword} ==========")
+        self.logger.info(f"========== 开始搜索关键字: {keyword} ==========")
         
         page_num = 1
         page_size = 20
@@ -417,7 +541,7 @@ class TYCSpider(base_spider):
             failure_count = 0
             
             # 提取数据
-            page_data = response_data.get("response_data", {}).get("data", {})
+            page_data = response_data.get("data", {})
             companies = page_data.get("companyList", [])
             total_pages = page_data.get("companyTotalPage", 1)
             
@@ -439,15 +563,24 @@ class TYCSpider(base_spider):
                     
                     output_file = os.path.join(self.data_direc, f"base_info_{company_id}.json")
                     
-                    # 如果文件已存在，跳过
+                    # 如果文件已存在，检查是不是存在creditCode
                     if os.path.exists(output_file):
-                        self.logger.debug(f"文件 {output_file} 已存在，跳过")
-                        continue
+                        with open(output_file, 'r', encoding='utf-8') as f:
+                            existing_data = json.load(f)
+                        if existing_data.get("creditCode"):
+                            self.logger.debug(f"文件 {output_file} 已存在，跳过")
+                            continue
                     
+                    # 搜索带<em>标签的字段，去掉标签后保存
+                    if "name" in company:
+                        company["name"] = company["name"].replace("<em>", "").replace("</em>", "")
+
                     try:
                         with open(output_file, 'w', encoding='utf-8') as f:
                             json.dump(company, f, ensure_ascii=False, indent=2)
                         self.logger.debug(f"已保存: base_info_{company_id}.json")
+                        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        self.write_db("tyc", company_id, "1", time_str, time_str, 1)
                     except Exception as e:
                         self.logger.error(f"保存文件失败: {output_file}, 错误: {e}")
             
@@ -487,13 +620,16 @@ class TYCSpider(base_spider):
 
 # ==================== 使用示例 ====================
 
-def test_investment_crawl():
+def test_investment_crawl(company_gid=None):
     """测试爬取天眼查对外投资信息
     """
     # 示例：爬取视源电子 (gid: 1391758803) 的对外投资信息
     spider = TYCSpider()
       
-    id_found = ["1391758803"] # 395739442 视源电子 1391758803 视睿电子
+    if company_gid:
+        id_found = [company_gid]
+    else:
+        id_found = ["1391758803"] # 395739442 视源电子 1391758803 视睿电子
 
     while True:
         for company_gid in id_found:
@@ -542,7 +678,7 @@ def test_company_search(keywords=None, max_page=None, save_to_file=True, output_
         spider.close_session()
     
     # 输出结果
-    print(f"\n========== 爬取完成 ==========")
+    print(f"========== 爬取完成 ==========")
     print(f"总共处理 {len(all_results)} 个关键字")
     
     for result in all_results:
@@ -561,6 +697,32 @@ def test_company_search(keywords=None, max_page=None, save_to_file=True, output_
     print(f"公司数据已保存到: {spider.data_direc}")
     
     return all_results
+
+
+def test_shareholder_crawl(company_gid=None):
+    """测试爬取天眼查股东信息
+    """
+    # 示例：爬取视源电子 (gid: 1391758803) 的股东信息
+    spider = TYCSpider()
+      
+    if company_gid:
+        gid_found = [company_gid]
+    else:
+        gid_found = ["1391758803"] # 395739442 视源电子 1391758803 视睿电子
+
+    while True:
+        for company_gid in gid_found:
+            try:
+                gid_found, hid_found = spider.get_all_shareholder(company_gid, save_to_file=True)
+                spider.logger.info(f"本次爬取完成，发现 {len(gid_found)} 家企业股东，{len(hid_found)} 位自然人股东")
+            except Exception as e:
+                gid_found = []
+                hid_found = []
+                spider.close_session()
+                break
+        
+        if len(gid_found) == 0 and len(hid_found) == 0:
+            break
 
 
 if __name__ == "__main__":
@@ -588,9 +750,11 @@ if __name__ == "__main__":
   # 保存搜索结果统计
   python -m tyc.spider -k "CVTE" -o results.json
   
-  # 运行测试
-  python -m tyc.spider -t search
-  python -m tyc.spider -t investment
+  # 爬取对外投资（在不搜索的时候启用）
+  python -m tyc.spider -t investment -ID 1391758803
+  
+  # 爬取股东信息（在不搜索的时候启用）
+  python -m tyc.spider -t shareholder -ID 1391758803
         """
     )
     
@@ -628,16 +792,18 @@ if __name__ == "__main__":
     # 测试参数
     parser.add_argument(
         "-t", "--test", 
-        choices=["search", "investment"], 
+        choices=["investment", "shareholder"], 
         help="运行测试类型"
+    )
+
+    parser.add_argument(
+        "-ID", "--company-gid",
+        type=str,
+        default=None,
+        help="公司 GID，用于投资爬取测试"
     )
     
     args = parser.parse_args()
-    
-    # 如果指定了测试类型为 investment，则运行投资爬取测试
-    if args.test == "investment":
-        test_investment_crawl()
-        sys.exit(0)
     
     # 获取关键字列表
     keywords = []
@@ -659,9 +825,12 @@ if __name__ == "__main__":
             sys.exit(1)
     
     if not keywords:
-        # 如果没有指定关键字，运行默认测试或显示帮助
-        if args.test == "search":
-            test_company_search()
+        # 如果没有指定关键字，
+        # 如果指定了测试类型为 investment，则运行投资爬取测试
+        if args.test == "investment":
+            test_investment_crawl(company_gid=args.company_gid)
+        elif args.test == "shareholder":
+            test_shareholder_crawl(company_gid=args.company_gid)
         else:
             parser.print_help()
         sys.exit(0)
@@ -671,8 +840,7 @@ if __name__ == "__main__":
     
     print(f"\n开始爬取 {len(keywords)} 个关键字的公司信息...")
     print(f"关键字列表: {keywords}\n")
-    
-    # 调用 test_company_search 进行搜索
+
     test_company_search(
         keywords=keywords,
         max_page=args.max_page,

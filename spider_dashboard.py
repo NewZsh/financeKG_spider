@@ -7,14 +7,15 @@
 ## 2. 各个爬虫的进度可视化展示
 ## 3. 关键词管理和上传
 
+import sys
+import threading
 import flask
 import os
-import json
+import time
 from datetime import datetime
-from werkzeug.utils import secure_filename
 
 import base_spider
-from qxb.spider import QXBspider
+from qxb.spider import QXBSpider
 from tyc.spider import TYCSpider
 
 app = flask.Flask(__name__)
@@ -27,11 +28,14 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 最大上传16MB
 
 # 获取项目根目录
 cur_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(cur_dir)
 app.config['UPLOAD_FOLDER'] = os.path.join(cur_dir, 'data', 'tyc_keywords')
+
+tyc_id_collection = set()
 
 # 初始化爬虫实例
 spider_instance = base_spider.base_spider()
-qxb_spider_instance = qxb_spider()
+qxb_spider_instance = QXBSpider()
 tyc_spider_instance = TYCSpider()
 
 # 确保上传目录存在
@@ -72,48 +76,42 @@ def validate_keywords_file(file_obj):
     return True, None
 
 
-def get_keywords_list():
+def get_keywords_list(
+    keywords_file=None, 
+    keywords_direc=None,
+    keywords_finished_fn=None
+):
     """
     获取当前的关键词列表
+
+    如果没有指定文件名，则从文件夹下全部读取，拼接返回
     
     Returns:
         dict: 关键词信息
     """
-    keywords_file = os.path.join(
-        app.config['UPLOAD_FOLDER'],
-        tyc_spider_instance.s_cfg.get('keywords_file', 'keywords.txt')
-    )
+    if keywords_file:
+        keywords_files = [keywords_file]
+    else:
+        keywords_files = []
+        if keywords_direc:
+            for filename in os.listdir(keywords_direc):
+                fn = os.path.join(keywords_direc, filename)
+                if fn != keywords_finished_fn:
+                    keywords_files.append(fn)
     
-    if not os.path.exists(keywords_file):
-        return {
-            "exists": False,
-            "keywords": [],
-            "count": 0,
-            "file_path": keywords_file
-        }
-    
-    try:
+    finished_keywords = set()
+    if keywords_finished_fn and os.path.exists(keywords_finished_fn):
+        with open(keywords_finished_fn, 'r', encoding='utf-8') as f:
+            finished_keywords = set([line.strip() for line in f if line.strip()])
+            
+    keywords = set()
+    for keywords_file in keywords_files:
         with open(keywords_file, 'r', encoding='utf-8') as f:
-            keywords = [line.strip() for line in f if line.strip()]
-        
-        file_stat = os.stat(keywords_file)
-        return {
-            "exists": True,
-            "keywords": keywords,
-            "count": len(keywords),
-            "file_path": keywords_file,
-            "file_size": file_stat.st_size,
-            "last_modified": datetime.fromtimestamp(file_stat.st_mtime).isoformat()
-        }
-    except Exception as e:
-        return {
-            "exists": True,
-            "error": str(e),
-            "keywords": [],
-            "count": 0,
-            "file_path": keywords_file
-        }
-
+            file_keywords = [line.strip() for line in f if line.strip()]
+            keywords.update(file_keywords)
+    
+    return len(finished_keywords), len(keywords)
+      
 
 @app.route('/')
 def index():
@@ -150,7 +148,6 @@ def index():
         <div class="section">
             <h2>天眼查爬虫</h2>
             <a href="/tyc/keywords">关键词管理</a>
-            <a href="/tyc/search">搜索公司</a>
             <a href="/tyc/stats">爬取统计</a>
         </div>
     </body>
@@ -196,24 +193,24 @@ def tyc_keywords():
         
         try:
             # 保存文件
-            filename = tyc_spider_instance.s_cfg.get('keywords_file', 'keywords.txt')
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            direc = tyc_spider_instance.s_cfg.get('keywords_direc')
+            filename = len(os.listdir(direc)) - 1
+            keywords_file = os.path.join(direc, f"keywords_{filename}.txt")
             
-            file.save(filepath)
+            file.save(keywords_file)
             
             # 返回成功信息
-            keywords_info = get_keywords_list()
+            _, keywords_cnt = get_keywords_list(keywords_file)
             return flask.jsonify({
                 "success": True,
-                "message": f"成功上传 {keywords_info['count']} 个关键词",
-                "keywords_info": keywords_info
+                "message": f"成功上传 {keywords_cnt} 个关键词",
             })
         
         except Exception as e:
             return flask.jsonify({"error": f"文件保存失败: {str(e)}"}), 500
     
     # GET 请求：返回关键词列表
-    keywords_info = get_keywords_list()
+    finished_keywords_cnt, keywords_cnt = get_keywords_list()
     
     html = f"""
     <!DOCTYPE html>
@@ -261,7 +258,7 @@ def tyc_keywords():
             <h2>上传关键词文件</h2>
             <div class="upload-area" onclick="document.getElementById('file-input').click()">
                 <p>📁 点击或拖拽上传 .txt 文件</p>
-                <p style="font-size: 12px; color: #666;">每行一个关键词，UTF-8 编码</p>
+                <p style="font-size: 12px; color: #666;">每行一个关键词</p>
             </div>
             <input type="file" id="file-input" accept=".txt" />
             <div id="upload-status" style="margin-top: 10px;"></div>
@@ -270,19 +267,14 @@ def tyc_keywords():
         <div class="section">
             <h2>当前关键词列表</h2>
             <div class="stats">
-                <p>📊 已有关键词: <strong>{keywords_info.get('count', 0)}</strong> 个</p>
-                {f'<p>📅 最后更新: {keywords_info.get("last_modified", "N/A")}</p>' if keywords_info.get('exists') else '<p>❌ 未上传关键词文件</p>'}
-            </div>
-            <div class="keywords-list">
-                {''.join(f'<div class="keyword-item">{kw}</div>' for kw in keywords_info.get('keywords', [])[:100])}
-                {f'<p style="color: #999; text-align: center;">... 还有 {keywords_info.get("count", 0) - 100} 个关键词</p>' if keywords_info.get('count', 0) > 100 else ''}
+                <p>📊 已有关键词: <strong>{keywords_cnt}</strong> 个</p>
+                <p>📅 已完成关键词：<strong>{finished_keywords_cnt}</strong> 个</p>
             </div>
         </div>
         
         <div class="section">
-            <h2>快速操作</h2>
+            <h2>示例</h2>
             <button onclick="downloadTemplate()">📥 下载示例文件</button>
-            <button onclick="window.location.href='/tyc/search'">🔍 开始搜索</button>
         </div>
         
         <script>
@@ -350,165 +342,6 @@ def tyc_keywords():
                 a.click();
                 window.URL.revokeObjectURL(url);
                 document.body.removeChild(a);
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    return html
-
-
-@app.route('/tyc/keywords/api', methods=['GET'])
-def tyc_keywords_api():
-    """
-    获取关键词列表 API
-    """
-    keywords_info = get_keywords_list()
-    return flask.jsonify(keywords_info)
-
-
-@app.route('/tyc/search', methods=['GET', 'POST'])
-def tyc_search():
-    """
-    天眼查搜索页面
-    """
-    if flask.request.method == 'POST':
-        # 处理搜索请求
-        keywords = flask.request.json.get('keywords', [])
-        max_page = flask.request.json.get('max_page')
-        
-        if not keywords:
-            return flask.jsonify({"error": "关键词列表为空"}), 400
-        
-        results = []
-        for keyword in keywords:
-            try:
-                result = tyc_spider_instance.search_companies(
-                    keyword,
-                    max_page=max_page,
-                    save_to_file=True
-                )
-                results.append({
-                    "keyword": keyword,
-                    "success": True,
-                    "data": result
-                })
-            except Exception as e:
-                results.append({
-                    "keyword": keyword,
-                    "success": False,
-                    "error": str(e)
-                })
-        
-        tyc_spider_instance.close_session()
-        return flask.jsonify({"results": results})
-    
-    # GET 请求：显示搜索页面
-    keywords_info = get_keywords_list()
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>天眼查 - 搜索公司</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            h1 {{ color: #333; }}
-            .section {{ margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 5px; }}
-            .controls {{ margin: 15px 0; }}
-            input, button, select {{ padding: 8px; margin: 5px; border: 1px solid #ccc; border-radius: 3px; }}
-            button {{ background: #0066cc; color: white; cursor: pointer; border: none; padding: 10px 20px; }}
-            button:hover {{ background: #0052a3; }}
-            .results {{ max-height: 500px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; }}
-            .result-item {{ margin: 10px 0; padding: 10px; background: white; border-left: 4px solid #0066cc; }}
-            .success {{ color: green; }}
-            .error {{ color: red; }}
-            .loading {{ color: #666; font-style: italic; }}
-            a {{ color: #0066cc; text-decoration: none; }}
-            a:hover {{ text-decoration: underline; }}
-        </style>
-    </head>
-    <body>
-        <a href="/">← 返回首页</a>
-        <h1>天眼查 - 搜索公司</h1>
-        
-        <div class="section">
-            <h2>搜索配置</h2>
-            <div class="controls">
-                <div>
-                    <label>关键词数量: <strong>{keywords_info.get('count', 0)}</strong></label>
-                </div>
-                <div>
-                    <label>最多爬取页数:</label>
-                    <input type="number" id="max-page" placeholder="留空表示爬取所有页" />
-                </div>
-                <div>
-                    <button onclick="startSearch()">🚀 开始搜索</button>
-                    <button onclick="window.location.href='/tyc/keywords'">⚙️ 管理关键词</button>
-                </div>
-            </div>
-        </div>
-        
-        <div class="section">
-            <h2>搜索进度</h2>
-            <div id="results" class="results">
-                <p class="loading">等待开始搜索...</p>
-            </div>
-        </div>
-        
-        <script>
-            async function startSearch() {{
-                const maxPage = document.getElementById('max-page').value || null;
-                const resultsDiv = document.getElementById('results');
-                resultsDiv.innerHTML = '<p class="loading">正在搜索...</p>';
-                
-                try {{
-                    // 获取关键词列表
-                    const keywordsRes = await fetch('/tyc/keywords/api');
-                    const keywordsData = await keywordsRes.json();
-                    const keywords = keywordsData.keywords;
-                    
-                    if (keywords.length === 0) {{
-                        resultsDiv.innerHTML = '<p class="error">❌ 还没有上传关键词文件</p>';
-                        return;
-                    }}
-                    
-                    // 开始搜索
-                    const searchRes = await fetch('/tyc/search', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{
-                            keywords: keywords,
-                            max_page: maxPage ? parseInt(maxPage) : null
-                        }})
-                    }});
-                    
-                    const results = await searchRes.json();
-                    
-                    // 显示结果
-                    let html = '';
-                    for (const result of results.results) {{
-                        if (result.success) {{
-                            html += `
-                                <div class="result-item success">
-                                    <strong>✅ ${{result.keyword}}</strong><br>
-                                    找到 ${{result.data.total_companies}} 家公司，${{result.data.total_pages}} 页
-                                </div>
-                            `;
-                        }} else {{
-                            html += `
-                                <div class="result-item error">
-                                    <strong>❌ ${{result.keyword}}</strong><br>
-                                    ${{result.error}}
-                                </div>
-                            `;
-                        }}
-                    }}
-                    resultsDiv.innerHTML = html;
-                }} catch (error) {{
-                    resultsDiv.innerHTML = `<p class="error">❌ 搜索失败: ${{error.message}}</p>`;
-                }}
             }}
         </script>
     </body>
@@ -653,5 +486,115 @@ def tyc_stats():
         return f"<h1>❌ 错误</h1><p>获取统计信息失败: {e}</p><a href='/tyc/keywords'>返回</a>", 500
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+# 启动后台线程：定时扫描配置中的 `keywords_direc`，处理新上传的关键词文件
+def _tyc_kw_watcher(poll_interval=10):
+    watcher_spider = TYCSpider()
+    kw_dir_rel = watcher_spider.s_cfg.get("keywords_direc", "./data/tyc_keywords/")
+    kw_dir = os.path.abspath(os.path.join(cur_dir, kw_dir_rel))
+    os.makedirs(kw_dir, exist_ok=True)
+
+    finished_file = watcher_spider.s_cfg.get("keywords_finised_fn", os.path.join(kw_dir, "keywords_finished.txt"))
+    if not os.path.exists(finished_file):
+        open(finished_file, 'a', encoding='utf-8').close()
+
+    def _load_finished():
+        try:
+            with open(finished_file, 'r', encoding='utf-8') as f:
+                return set([l.strip() for l in f if l.strip()])
+        except Exception:
+            return set()
+
+    while True:
+        finished = _load_finished()
+        for fn in os.listdir(kw_dir):
+            if fn == os.path.basename(finished_file):
+                continue
+            if fn.startswith('.'): # 避开重命名为.processed开头，也避开.finished开头
+                continue
+            path = os.path.join(kw_dir, fn)
+            if not os.path.isfile(path):
+                continue
+
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    kws = [ln.strip() for ln in f if ln.strip()]
+            except Exception:
+                watcher_spider.logger.exception(f"读取关键词文件失败: {path}")
+                continue
+
+            for kw in kws:
+                if kw in finished:
+                    continue
+
+                try:
+                    result = watcher_spider.search_companies(kw, max_page=2, save_to_file=True)
+                    tyc_id_collection.update(result["company_ids"])
+
+                    with open(finished_file, 'a', encoding='utf-8') as ff:
+                        ff.write(kw + '\n')
+                    finished.add(kw)
+                except Exception:
+                    watcher_spider.logger.exception(f"Watcher 搜索失败: {kw}")
+
+            # 尝试将已处理的文件重命名，避免再次扫描同一上传文件
+            try:
+                processed_path = ".processed" + path
+                if not os.path.exists(processed_path):
+                    os.rename(path, processed_path)
+            except Exception:
+                watcher_spider.logger.debug(f"无法重命名文件: {path}")
+            
+        time.sleep(poll_interval)
+
+# 启动后台线程：定时爬取对外投资和股东
+def _tyc_id_watcher(poll_interval=60):
+    while True:
+        if len(tyc_id_collection) == 0:
+            time.sleep(poll_interval)
+            continue
+
+        watcher_spider = TYCSpider()
+        for company_gid in tyc_id_collection:
+            try:
+                id_found = watcher_spider.get_all_investment(company_gid, save_to_file=True)
+                watcher_spider.logger.info(f"本次爬取完成，发现 {len(id_found)} 家被投资公司")
+                gid_found, hid_found = watcher_spider.get_all_shareholder(company_gid, save_to_file=True)
+                watcher_spider.logger.info(f"本次爬取完成，发现 {len(gid_found)} 家企业股东，{len(hid_found)} 位自然人股东")
+            except Exception as e:
+                id_found = []
+                watcher_spider.close_session()
+                break
+        
+        tyc_id_collection.update(id_found)
+        tyc_id_collection.update(gid_found)
+
+
+# 启动仪表板
+if __name__ == "__main__":
+    watcher_thread = threading.Thread(target=_tyc_kw_watcher, args=(10,), daemon=True)
+    watcher_thread.start()
+    print("关键词监控已启动（后台线程）")
+
+    watcher_thread = threading.Thread(target=_tyc_id_watcher, args=(10,), daemon=True)
+    watcher_thread.start()
+    print("新id监控已启动（后台线程）")
+
+    print("=" * 60)
+    print("🕷️  FinanceKG Spider Dashboard 启动中...")
+    print("=" * 60)
+    print("\n📱 Web 仪表板地址：http://localhost:5000")
+    print("📝 功能列表：")
+    print("   • 首页：http://localhost:5000/")
+    print("   • 关键词管理：http://localhost:5000/tyc/keywords")
+    print("\n💡 提示：")
+    print("   1. 首次使用请先上传关键词文件")
+    print("   2. 关键词文件在 data/tyc_keywords/ 目录下")
+    print("   3. 爬取的公司数据保存在 data/tyc_data/ 目录下")
+    print("\n按 Ctrl+C 停止服务器\n")
+
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=True)
+    except KeyboardInterrupt:
+        print("\n\n服务器已停止")
+        sys.exit(0)
+

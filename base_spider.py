@@ -125,7 +125,6 @@ class base_spider:
         self.timer = threading.Timer(self.refresh_interval, self.__cfg_refresh_cycle)
         self.timer.daemon = True  # 设置为守护线程，主程序退出时自动结束
         self.timer.start()
-        self.logger.info(f"配置自动刷新定时器已启动，间隔: {self.refresh_interval}秒")
     
     def __cfg_refresh_cycle(self):
         '''
