@@ -1,0 +1,66 @@
+# Git ignore rules for FinanceKG_spider
+
+# Exclude data directories (raw data, downloaded files, outputs)
+data/
+
+# Logs
+logs/
+*.log
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+
+# Virtual environments
+venv/
+env/
+ENV/
+/.venv/
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# SQLite and local DBs
+*.db
+*.sqlite
+*.sqlite3
+
+# Sensitive or environment files
+.env
+.env.*
+secrets.cfg
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+
+# Processed uploads or marker files
+*.processed
+
+# Coverage
+.coverage
+htmlcov/
+
+# Ignore Python egg/cache metadata
+__pypackages__/
