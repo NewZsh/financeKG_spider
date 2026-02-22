@@ -14,7 +14,7 @@ import os
 import time
 from datetime import datetime
 
-import base_spider
+from base_spider import ThreadSafeUniqueQueue, base_spider
 from qxb.spider import QXBSpider
 from tyc.spider import TYCSpider
 
@@ -31,12 +31,12 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(cur_dir)
 app.config['UPLOAD_FOLDER'] = os.path.join(cur_dir, 'data', 'tyc_keywords')
 
-tyc_id_collection = set()
 
 # 初始化爬虫实例
-spider_instance = base_spider.base_spider()
+tyc_id_collect_queue = ThreadSafeUniqueQueue()
+spider_instance = base_spider()
 qxb_spider_instance = QXBSpider()
-tyc_spider_instance = TYCSpider()
+tyc_spider_instance = TYCSpider(tyc_id_collect_queue)
 
 # 确保上传目录存在
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -488,7 +488,7 @@ def tyc_stats():
 
 # 启动后台线程：定时扫描配置中的 `keywords_direc`，处理新上传的关键词文件
 def _tyc_kw_watcher(poll_interval=10):
-    watcher_spider = TYCSpider()
+    watcher_spider = TYCSpider(tyc_id_collect_queue)
     kw_dir_rel = watcher_spider.s_cfg.get("keywords_direc", "./data/tyc_keywords/")
     kw_dir = os.path.abspath(os.path.join(cur_dir, kw_dir_rel))
     os.makedirs(kw_dir, exist_ok=True)
@@ -528,7 +528,6 @@ def _tyc_kw_watcher(poll_interval=10):
 
                 try:
                     result = watcher_spider.search_companies(kw, max_page=2, save_to_file=True)
-                    tyc_id_collection.update(result["company_ids"])
 
                     with open(finished_file, 'a', encoding='utf-8') as ff:
                         ff.write(kw + '\n')
@@ -538,7 +537,8 @@ def _tyc_kw_watcher(poll_interval=10):
 
             # 尝试将已处理的文件重命名，避免再次扫描同一上传文件
             try:
-                processed_path = ".processed" + path
+                processed_fn = ".processed" + fn
+                processed_path = os.path.join(kw_dir, processed_fn)
                 if not os.path.exists(processed_path):
                     os.rename(path, processed_path)
             except Exception:
@@ -548,29 +548,35 @@ def _tyc_kw_watcher(poll_interval=10):
 
 # 启动后台线程：定时爬取对外投资和股东
 def _tyc_id_watcher(poll_interval=60):
+    watcher_spider = TYCSpider(tyc_id_collect_queue)
+
+    # 从 db 中的 todo 表获取待爬取的 id，进行爬取
+    watcher_spider.load_db()
+
     while True:
-        if len(tyc_id_collection) == 0:
+        if watcher_spider.id_collect_queue.empty():
             time.sleep(poll_interval)
             continue
 
-        watcher_spider = TYCSpider()
-        for company_gid in tyc_id_collection:
-            try:
-                id_found = watcher_spider.get_all_investment(company_gid, save_to_file=True)
+        try:
+            company_gid = watcher_spider.id_collect_queue.get()
+            id_found = watcher_spider.get_all_investment(company_gid, save_to_file=True)
+            if id_found:
                 watcher_spider.logger.info(f"本次爬取完成，发现 {len(id_found)} 家被投资公司")
-                gid_found, hid_found = watcher_spider.get_all_shareholder(company_gid, save_to_file=True)
+            result = watcher_spider.get_all_shareholder(company_gid, save_to_file=True)
+            if result:
+                gid_found, hid_found = result
                 watcher_spider.logger.info(f"本次爬取完成，发现 {len(gid_found)} 家企业股东，{len(hid_found)} 位自然人股东")
-            except Exception as e:
-                id_found = []
-                watcher_spider.close_session()
-                break
-        
-        tyc_id_collection.update(id_found)
-        tyc_id_collection.update(gid_found)
+            watcher_spider.write_db(src="tyc", id=company_gid, entity_type="1")
+        except Exception as e:
+            watcher_spider.logger.info(f"本次爬取失败，错误原因: {e}")
+            watcher_spider.close_session()
 
 
 # 启动仪表板
 if __name__ == "__main__":
+    port = 9000
+
     watcher_thread = threading.Thread(target=_tyc_kw_watcher, args=(10,), daemon=True)
     watcher_thread.start()
     print("关键词监控已启动（后台线程）")
@@ -582,10 +588,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🕷️  FinanceKG Spider Dashboard 启动中...")
     print("=" * 60)
-    print("\n📱 Web 仪表板地址：http://localhost:5000")
+    print(f"\n📱 Web 仪表板地址：http://localhost:{port}")
     print("📝 功能列表：")
-    print("   • 首页：http://localhost:5000/")
-    print("   • 关键词管理：http://localhost:5000/tyc/keywords")
+    print(f"   • 首页：http://localhost:{port}/")
+    print(f"   • 关键词管理：http://localhost:{port}/tyc/keywords")
     print("\n💡 提示：")
     print("   1. 首次使用请先上传关键词文件")
     print("   2. 关键词文件在 data/tyc_keywords/ 目录下")
@@ -593,7 +599,7 @@ if __name__ == "__main__":
     print("\n按 Ctrl+C 停止服务器\n")
 
     try:
-        app.run(host='0.0.0.0', port=5000, debug=True)
+        app.run(host='0.0.0.0', port=port, debug=True)
     except KeyboardInterrupt:
         print("\n\n服务器已停止")
         sys.exit(0)

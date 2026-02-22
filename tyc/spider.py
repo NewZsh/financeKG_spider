@@ -5,15 +5,17 @@
 # Description: Spider for tianyancha (天眼查) website
 #              - Company Search Crawler
 #              - Investment Information Crawler
+#              - Shareholder Information Crawler
+# 当前版本 v1.0，未支持老旧信息的重新爬取，当前默认是只爬取被第一次发现的id
+
+import sqlite3
 
 import requests
 import time
 import json
 import os
 import sys
-import threading
 from datetime import datetime
-import uuid
 
 # back to main directory
 cur_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,12 +23,11 @@ sys.path.append(cur_dir)
 
 from base_spider import base_spider
 
-
 class TYCSpider(base_spider):
     """天眼查爬虫 - 统一处理公司搜索和投资信息爬取"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, id_collect_queue):
+        super().__init__(id_collect_queue)
         self.s_cfg = self.cfg[self.__class__.__name__]
         
         # 初始化 Session，保持会话和复用连接
@@ -42,6 +43,37 @@ class TYCSpider(base_spider):
         # 多次请求失败后，置为False，暂停请求，等待人工干预
         self.headers_is_valid = True
         self.headers_trial_limit = 3  # 允许的连续失败次数
+
+    def is_id_in_db(self, id):
+        conn = sqlite3.connect( self.db_file)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 1 FROM todo WHERE src='tyc' AND entity_type='1' AND id=?
+            UNION
+            SELECT 1 FROM record WHERE id=?
+            LIMIT 1
+        """, (id, id))
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+
+    def filter_new_ids(self, id_list):
+        if not id_list:
+            return []
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        # 构造批量查询
+        placeholders = ','.join(['?'] * len(id_list))
+        sql = f"""
+            SELECT id FROM todo WHERE src='tyc' AND entity_type='1' AND id IN ({placeholders})
+            UNION
+            SELECT id FROM record WHERE id IN ({placeholders})
+        """
+        cursor.execute(sql, id_list + id_list)
+        existing_ids = set(row[0] for row in cursor.fetchall())
+        conn.close()
+        # 返回未在数据库中的ID
+        return [i for i in id_list if i not in existing_ids]
 
     def get_headers(self):
         """
@@ -388,6 +420,13 @@ class TYCSpider(base_spider):
                 self.logger.warning("页码超过限制，停止爬取")
                 break
 
+        # 新发现的 id 继续加入队列
+        new_ids = self.filter_new_ids(list(gid_found))
+        for cid in new_ids:
+            if self.id_collect_queue is not None:
+                self.id_collect_queue.put(cid)
+            self.add_to_todo(src="tyc", id=cid, entity_type="1")
+
         return list(gid_found), list(hid_found)
     
     def get_all_investment(self, company_gid, save_to_file=False):
@@ -482,6 +521,13 @@ class TYCSpider(base_spider):
                 self.logger.warning("页码超过限制，停止爬取")
                 break
         
+        # 新发现的 id 继续加入队列
+        new_ids = self.filter_new_ids(list(id_found))
+        for cid in new_ids:
+            if self.id_collect_queue is not None:
+                self.id_collect_queue.put(cid)
+            self.add_to_todo(src="tyc", id=cid, entity_type="1")
+
         return list(id_found)
 
     def search_companies(self, keyword, max_page=None, save_to_file=True):
@@ -494,6 +540,11 @@ class TYCSpider(base_spider):
         
         Returns:
             dict: 搜索结果统计信息
+    
+        注意：搜索的时候，即使是已经被其他公司的投资或股东所牵连的id，由于本身无credit code等唯一码，在本段代码中，会被新爬的所覆盖。
+        这种设计本身也是因为用户如果主动要求搜索，那么用户是很关心这家公司的，所以基础信息也要齐全，而如果一家公司是被其他公司通过关系
+        牵连到的，那么用户可能只是想知道这个公司，至于这个公司的其他信息，用户可能并不关心，所以就不需要去爬取了。这种设计也就导致，在
+        db文件中，牵连出来的id，也可以记录为已经爬取，后续用户主动搜索的话并不会因为已经爬取而跳过爬取了。总之，搜索的优先级是高于被牵连的。
         """
         if not self.headers_is_valid:
             self.logger.warning("请求头无效，暂停请求")
@@ -579,8 +630,7 @@ class TYCSpider(base_spider):
                         with open(output_file, 'w', encoding='utf-8') as f:
                             json.dump(company, f, ensure_ascii=False, indent=2)
                         self.logger.debug(f"已保存: base_info_{company_id}.json")
-                        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        self.write_db("tyc", company_id, "1", time_str, time_str, 1)
+                        self.write_db(src="tyc", id=company_id, entity_type="1")
                     except Exception as e:
                         self.logger.error(f"保存文件失败: {output_file}, 错误: {e}")
             
@@ -608,6 +658,13 @@ class TYCSpider(base_spider):
         }
         
         self.logger.info(f"搜索完成: 共找到 {company_count} 家公司，跨越 {total_pages} 页")
+
+        # 新发现的 id 继续加入队列
+        new_ids = self.filter_new_ids(company_ids)
+        for cid in new_ids:
+            if self.id_collect_queue is not None:
+                self.id_collect_queue.put(cid)
+            self.add_to_todo(src="tyc", id=cid, entity_type="1")
         
         return result
 
@@ -616,6 +673,24 @@ class TYCSpider(base_spider):
         if self.session:
             self.session.close()
             self.logger.info("Session 已关闭，资源已释放")
+    
+    # 每次重新启动主函数的时候，都会调用 load_db 来加载已经发现的 id 加入到队列中，继续爬取
+    def load_db(self):
+        # debug等模式下不设置队列，直接返回
+        if self.id_collect_queue is None:
+            self.logger.warning("ID 收集队列未设置，无法加载数据库")
+            return
+        
+        # 从数据库加载已爬取的 id，加入队列
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM todo WHERE src='tyc' AND entity_type='1'")
+        rows = cursor.fetchall()
+        for row in rows:
+            id = row[0]
+            self.id_collect_queue.put(id)
+        self.logger.info(f"从数据库加载了 {len(rows)} 个 ID 加入队列")
+        conn.close()
 
 
 # ==================== 使用示例 ====================

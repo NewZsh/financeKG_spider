@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import sqlite3
+import queue
 
 try:
     import fcntl  # 文件锁支持 (Unix only)
@@ -25,8 +26,50 @@ logger.add(
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {file}:{line} - {message}",
 )
 
-class base_spider:
+
+# thead safety unique queue
+# for the usage of the spider to
+# - put a new collected id
+# - get a id to crawl its info
+class ThreadSafeUniqueQueue:
     def __init__(self):
+        self._queue = queue.Queue()
+        self._set = set()
+        self._lock = threading.Lock()
+
+    def put(self, item):
+        with self._lock:
+            if item not in self._set:
+                self._set.add(item)
+                self._queue.put(item)
+
+    def get(self):
+        item = self._queue.get()
+        with self._lock:
+            self._set.discard(item)
+        return item
+
+    def task_done(self):
+        self._queue.task_done()
+
+    def empty(self):
+        return self._queue.empty()
+
+    def qsize(self):
+        return self._queue.qsize()
+
+    def clear(self):
+        with self._lock:
+            self._set.clear()
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+
+
+class base_spider:
+    def __init__(self, id_collect_queue = None):
         self.ua_list = [
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
         ]
@@ -48,13 +91,16 @@ class base_spider:
         self.__load_cfg()
         self.__start_cfg_refresh_timer()
 
-        ## 用sql管理爬虫进展
-        ## sql维护两个表，一个是record（已经爬过的记录），一个是todo（待爬取的记录）
-        ## record表结果：src, id, entity_type, visit_time(YYYY-MM-DD), last_visit_time, visit_times
-        ## todo表结果：src, id, entity_type, found_time
+        # 用sql管理爬虫进展
+        # sql维护两个表，一个是record（已经爬过的记录），一个是todo（待爬取的记录）
+        # record表结果：src, id, entity_type, visit_time(YYYY-MM-DD), last_visit_time, visit_times
+        # todo表结果：src, id, entity_type, found_time
         self.db_file = "data/spider_progress.db"
         self.db_file =  os.path.join(cur_dir, self.db_file)
         self.__init_db()
+
+        # 用队列进行跨线程管理
+        self.id_collect_queue = id_collect_queue
 
     def __init_db(self):
         '''
@@ -104,9 +150,18 @@ class base_spider:
     # cfg 允许热更，更新参数直接作用于爬虫后台而无需重启
     def __refresh_cfg(self):
         '''
-        重新加载配置
+        重新加载配置，仅在实际变更时打印日志
         '''
-        self.__load_cfg()
+        try:
+            old_cfg = self.cfg.copy() if hasattr(self, 'cfg') else None
+            with open(self.cfg_file, 'r') as f:
+                new_cfg = json.loads(f.read())
+            if old_cfg != new_cfg:
+                self.cfg = new_cfg
+                self.logger.info(f"配置变更，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            # 否则不打印日志
+        except Exception as e:
+            self.logger.exception(f"配置刷新失败: {e}")
     
     def __write_cfg(self):
         '''
@@ -168,12 +223,13 @@ class base_spider:
             "https": f"http://{proxy}",
         }
 
-    ## ** PART 3 : 相关统计函数 ** ##
-    def write_db(self, src, id, entity_type, visit_time, last_visit_time, visit_times):
+    ## ** PART 3 : 数据库相关写入函数 ** ##
+    def write_db(self, src, id, entity_type):
         '''
         写入数据库
         
         如果第一次访问，last_visit_time 设置为 visit_time，visit_times 设置为 1
+        如果之前访问过，last_visit_time 更新为上一次的 visit_time，visit_time 更新为当前时间，visit_times + 1
         '''
         time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -186,17 +242,43 @@ class base_spider:
         ''', (src, id))
         exists = cursor.fetchone()[0] > 0
         if exists:
+            # 获取上一次访问时间
+            cursor.execute('''
+                SELECT visit_time FROM record WHERE src=? AND id=?
+            ''', (src, id))
+            visit_time = cursor.fetchone()[0]
             cursor.execute('''
                 UPDATE record SET visit_time=?, last_visit_time=?, visit_times=visit_times+1 WHERE src=? AND id=?
             ''', (time_str, visit_time, src, id))
         else:
+            visit_time = time_str
+            last_visit_time = time_str
             cursor.execute('''
                 INSERT INTO record (src, id, entity_type, visit_time, last_visit_time, visit_times)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (src, id, entity_type, visit_time, last_visit_time, visit_times))
+            ''', (src, id, entity_type, visit_time, last_visit_time, 1))
         conn.commit()
         conn.close()
+
+    def add_to_todo(self, src, id, entity_type):
+        '''
+        添加待爬取记录到todo表
+        '''
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+
+        # 插入记录，如果已存在则忽略
+        cursor.execute('''
+            INSERT OR IGNORE INTO todo (src, id, entity_type, found_time)
+            VALUES (?, ?, ?, ?)
+        ''', (src, id, entity_type, time_str))
         
+        conn.commit()
+        conn.close()
+
+    ## ** PART 4 : 相关统计函数 ** ##
     def __get_stats(self):
         '''
         获取统计信息
