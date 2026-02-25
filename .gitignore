@@ -1,7 +1,8 @@
 # Git ignore rules for FinanceKG_spider
 
 # Exclude data directories (raw data, downloaded files, outputs)
-data/
+data/*
+!data/README.md
 
 # Logs
 logs/
