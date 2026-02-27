@@ -4,6 +4,9 @@
 data/*
 !data/README.md
 
+# Exclude .venv and virtual environment directories
+.venv/
+
 # Logs
 logs/
 *.log
