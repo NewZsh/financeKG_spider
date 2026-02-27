@@ -43,6 +43,9 @@ Neo4j 是否会重复导入，取决于你导入数据的方式和 Cypher 语句
 class Neo4jManager:
     def __init__(self, uri="neo4j://localhost:7687", user="neo4j", password="83939190ys"):
         self.graph = Graph(uri, auth=(user, password))
+    
+    def flush_db(self):
+        self.graph.delete_all()
 
     def add_company(self, company_id, name):
         node = Node("Company", id=company_id, name=name)
@@ -69,6 +72,11 @@ class Neo4jManager:
                 investee_name=investee.get("name"),
             )
             self.graph.merge(rel)
+        else:
+            if not investor:
+                print(f"{investor_id} not found")
+            if not investee:
+                print(f"{investee_id} not found")
 
     def add_shareholder(self, company_id, shareholder_id, shareholder_type="Company", percent=None):
         # resolve nodes so that we can include their names on the edge
@@ -87,6 +95,11 @@ class Neo4jManager:
                 company_name=company.get("name"),
             )
             self.graph.merge(rel)
+        else:
+            if not company:
+                print(f"{company_id} not found")
+            if not shareholder:
+                print(f"{shareholder_id} not found")
 
     def get_graph_data(self, limit=100):
         # return a simplified structure with names alongside the raw nodes/relationships
@@ -107,8 +120,11 @@ class DataImporter:
         self.data_dir = data_dir
 
     def import_all(self):
-        # 1. 读取所有 base_info_*.json 文件，导入公司和人物节点
         base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
+        investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
+        shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")]
+
+        # 1. 读取所有 base_info_*.json 文件，导入公司和人物节点
         for file in tqdm.tqdm(base_info_files, desc="导入公司信息"):
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -117,38 +133,80 @@ class DataImporter:
                 name = data.get("name")
                 if company_id and name:
                     self.neo4j_manager.add_company(company_id, name)
-
-        # 2. 读取所有 investments_*.json 文件，导入投资关系
-        investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
-        for file in tqdm.tqdm(investment_files, desc="导入投资关系"):
+        
+        # 1.1 先把所有公司导入，再导入投资关系和股东关系
+        for file in tqdm.tqdm(investment_files, desc="导入投资关系中的公司"):
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
                 for line in f:
                     inv = json.loads(line)
-                    investor_id = str(inv.get("investor_id"))
-                    investee_id = str(inv.get("investee_id"))
-                    percent = inv.get("percent")
+
+                    id1 = inv.get("id")
+                    tags = inv.get("tags", [{}])
+                    if len(tags) == 0:
+                        print(f"invalid tags in file {file}")
+                        tag = {}
+                    else:
+                        tag = tags[0]
+                    id2 = tag.get("companyId")
+                    if id1 and id2 and id1 != id2:
+                        print(f"invalid data: id {id1} id2 {id2} in file {file}")
+
+                    investee_id = inv.get("id")
+                    if investee_id is None:
+                        tags = inv.get("tags", [{}])
+                        if len(tags) > 0:
+                            tag = tags[0]
+                            investee_id = tag.get("companyId")
+                    investee_name = inv.get("name")
+                    if investee_id and investee_name:
+                        self.neo4j_manager.add_company(investee_id, investee_name)
+                    else:
+                        print(f"invalid data: id {investee_id} name {investee_name} in file {file}")
+        for file in tqdm.tqdm(shareholder_files, desc="导入股东关系中的公司和人物"):
+            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                for line in f:
+                    sh = json.loads(line)
+                    shareholder_type = sh.get("shareHolderType")
+                    if shareholder_type == 2: # 企业股东
+                        shareholder_id = sh.get("shareHolderPid")
+                    else:
+                        shareholder_id = sh.get("shareHolderHid")
+                    shareholder_name = sh.get("shareHolderName", "")
+                    if shareholder_id and shareholder_name:
+                        if shareholder_type == 2: # 企业股东
+                            self.neo4j_manager.add_company(shareholder_id, shareholder_name)
+                        else:
+                            self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                    else:
+                        print(f"invalid data: id {shareholder_id} name {shareholder_name} in file {file}")
+
+        # 2. 读取所有 investments_*.json 文件，导入投资关系
+        for file in tqdm.tqdm(investment_files, desc="导入投资关系"):
+            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                investor_id = file.split("_", 1)[1].split(".", 1)[0] # 从文件名中提取投资方ID
+                for line in f:
+                    inv = json.loads(line)
+                    investee_id = inv.get("id")
+                    investee_name = inv.get("name")
+                    percent = inv.get("totalPercent")
                     if investor_id and investee_id:
-                        self.neo4j_manager.add_company(investor_id, inv.get("investor_name", ""))
-                        self.neo4j_manager.add_company(investee_id, inv.get("investee_name", ""))
                         self.neo4j_manager.add_investment(investor_id, investee_id, percent)
 
         # 3. 读取所有 shareholders_*.json 文件，导入股东关系
-        shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")]
         for file in tqdm.tqdm(shareholder_files, desc="导入股东关系"):
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                company_id = file.split("_")[1].split(".")[0]  # 从文件名中提取公司ID
+                company_id = file.split("_", 1)[1].split(".", 1)[0]  # 从文件名中提取公司ID
                 for line in f:
                     sh = json.loads(line)
-                    shareholder_id = sh.get("mainIdStr")
                     shareholder_type = sh.get("shareHolderType")
-                    percent = sh.get("percent")
-                    shareholder_name = sh.get("shareholder_name", "")
                     if shareholder_type == 2: # 企业股东
-                        self.neo4j_manager.add_company(shareholder_id, shareholder_name)
+                        shareholder_id = sh.get("shareHolderPid")
                     else:
-                        self.neo4j_manager.add_person(shareholder_id, shareholder_name)
-                    self.neo4j_manager.add_company(company_id, sh.get("company_name", ""))
-                    self.neo4j_manager.add_shareholder(company_id, shareholder_id, shareholder_type, percent)
+                        shareholder_id = sh.get("shareHolderHid")
+                    percent = sh.get("percent")
+                    shareholder_name = sh.get("shareHolderName", "")
+                    if shareholder_id and shareholder_name:
+                        self.neo4j_manager.add_shareholder(company_id, shareholder_id, shareholder_type, percent)
 
 
 if __name__ == "__main__":
@@ -160,6 +218,8 @@ if __name__ == "__main__":
     data_dir = os.path.join(os.path.dirname(__file__), 'data/tyc_data')
     print("开始导入数据到 Neo4j...")
     neo4j_manager = Neo4jManager()
+    # neo4j_manager.flush_db()
+    
     importer = DataImporter(neo4j_manager, data_dir=data_dir)
     importer.import_all()
     print("数据导入完成！")

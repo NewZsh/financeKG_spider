@@ -75,10 +75,93 @@ python spider_dashboard.py
 - 上传 `.txt` 文件（UTF-8 编码，每行一个）
 - 支持拖拽上传，可下载示例文件
 
-## 📁 项目结构
+### 4. Neo4j 图数据库
+
+`neo4j_utils.py` 负责将爬取到的企业数据导入 Neo4j 图数据库，构建企业投资/股东关系图谱。
+
+#### 安装 Neo4j
+
+| 平台 | 推荐方式 | 命令/步骤 |
+|------|---------|----------|
+| **macOS** | Homebrew | `brew install neo4j` → `neo4j start` |
+| **Windows** | Neo4j Desktop | [下载地址](https://neo4j.com/download/)，双击安装即可 |
+| **通用（推荐）** | Docker | 见下方 Docker 命令 |
+
+**Docker 一键启动：**
+```bash
+docker run -d --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your_password \
+  -v neo4j_data:/data \
+  neo4j:latest
+```
+
+- `7474`：Neo4j Browser（Web 管理界面）
+- `7687`：Bolt 协议端口（代码连接用）
+
+#### 配置连接
+
+`neo4j_utils.py` 中的默认连接参数：
+
+```python
+Neo4jManager(uri="neo4j://localhost:7687", user="neo4j", password="your_password")
+```
+
+如需修改密码或地址，直接在实例化时传入参数即可。
+
+#### 导入数据
+
+确保 Neo4j 服务已启动，然后执行：
+
+```bash
+python neo4j_utils.py
+```
+
+该脚本会自动读取 `data/tyc_data/` 下的数据文件并批量导入：
+
+| 文件类型 | 导入内容 |
+|---------|---------|
+| `base_info_{id}.json` | 公司节点（Company） |
+| `investments_{id}.json` | 被投公司节点 + 投资关系（INVEST） |
+| `shareholders_{id}.json` | 股东节点（Company/Person） + 股东关系（SHAREHOLDER） |
+
+> **注意**：脚本使用 `MERGE` 语句导入，重复执行不会产生重复数据。
+
+#### 查看图谱
+
+1. 浏览器访问 `http://localhost:7474/`
+2. 默认用户名 `neo4j`，密码为你设置的密码（首次登录需修改）
+3. 在 Cypher 控制台执行查询语句
+
+#### 常用 Cypher 查询
+
+```cypher
+-- 查询所有公司节点
+MATCH (c:Company) RETURN c LIMIT 20;
+
+-- 查询所有人物节点
+MATCH (p:Person) RETURN p LIMIT 20;
+
+-- 查询公司之间的投资关系
+MATCH (a:Company)-[r:INVEST]->(b:Company) RETURN a, r, b LIMIT 20;
+
+-- 查询某个公司的所有股东
+MATCH (s)-[r:SHAREHOLDER]->(c:Company {id: "公司ID"}) RETURN s, r, c;
+
+-- 查询某个人/公司作为股东投资的所有公司
+MATCH (s {id: "股东ID"})-[r:SHAREHOLDER]->(c:Company) RETURN s, r, c;
+
+-- 查看全部图谱（限制 50 条）
+MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50;
+```
+
+---
+
+## �📁 项目结构
 
 ```
 ├── spider_dashboard.py           # 启动脚本：Web 仪表板（关键词管理+搜索）
+├── neo4j_utils.py                # Neo4j 图数据库工具（数据导入+查询）
 ├── tyc/spider.py                 # 天眼查爬虫（搜索+投资信息）
 ├── base_spider.py                # 基础爬虫类
 ├── spider.cfg                    # 爬虫配置
