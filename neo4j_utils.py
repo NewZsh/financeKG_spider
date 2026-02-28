@@ -143,13 +143,13 @@ class DataImporter:
                     id1 = inv.get("id")
                     tags = inv.get("tags", [{}])
                     if len(tags) == 0:
-                        print(f"invalid tags in file {file}")
+                        # print(f"invalid tags in file {file}") # 冗余检查，理解数据所用。事实上有可能是HK公司，天眼查是有数据的，但是在对外投资关系中天眼查未将其基础数据作为 tags 返回
                         tag = {}
                     else:
                         tag = tags[0]
                     id2 = tag.get("companyId")
                     if id1 and id2 and id1 != id2:
-                        print(f"invalid data: id {id1} id2 {id2} in file {file}")
+                        raise ValueError(f"invalid data: id {id1} id2 {id2} in file {file}") # 冗余检查，如果二者皆有，没有发现不一致
 
                     investee_id = inv.get("id")
                     if investee_id is None:
@@ -161,22 +161,23 @@ class DataImporter:
                     if investee_id and investee_name:
                         self.neo4j_manager.add_company(investee_id, investee_name)
                     else:
-                        print(f"invalid data: id {investee_id} name {investee_name} in file {file}")
+                        print(f"invalid data: id {investee_id} name {investee_name} in file {file}") # 冗余检查，没进入过这一行，说明 id 和 name 都齐全
         for file in tqdm.tqdm(shareholder_files, desc="导入股东关系中的公司和人物"):
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
                 for line in f:
                     sh = json.loads(line)
                     shareholder_type = sh.get("shareHolderType")
-                    if shareholder_type == 2: # 企业股东
+                    if shareholder_type == 1: # 自然人股东
                         shareholder_id = sh.get("shareHolderPid")
-                    else:
-                        shareholder_id = sh.get("shareHolderHid")
+                    else: # 企业股东/其他
+                        shareholder_id = sh.get("shareHolderNameId")
+                        
                     shareholder_name = sh.get("shareHolderName", "")
                     if shareholder_id and shareholder_name:
-                        if shareholder_type == 2: # 企业股东
-                            self.neo4j_manager.add_company(shareholder_id, shareholder_name)
-                        else:
+                        if shareholder_type == 1:
                             self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                        else:
+                            self.neo4j_manager.add_company(shareholder_id, shareholder_name)                            
                     else:
                         print(f"invalid data: id {shareholder_id} name {shareholder_name} in file {file}")
 
@@ -199,10 +200,10 @@ class DataImporter:
                 for line in f:
                     sh = json.loads(line)
                     shareholder_type = sh.get("shareHolderType")
-                    if shareholder_type == 2: # 企业股东
+                    if shareholder_type == 1: # 自然人股东
                         shareholder_id = sh.get("shareHolderPid")
-                    else:
-                        shareholder_id = sh.get("shareHolderHid")
+                    else: # 企业股东/其他
+                        shareholder_id = sh.get("shareHolderNameId")
                     percent = sh.get("percent")
                     shareholder_name = sh.get("shareHolderName", "")
                     if shareholder_id and shareholder_name:
@@ -218,7 +219,7 @@ if __name__ == "__main__":
     data_dir = os.path.join(os.path.dirname(__file__), 'data/tyc_data')
     print("开始导入数据到 Neo4j...")
     neo4j_manager = Neo4jManager()
-    # neo4j_manager.flush_db()
+    neo4j_manager.flush_db()
     
     importer = DataImporter(neo4j_manager, data_dir=data_dir)
     importer.import_all()

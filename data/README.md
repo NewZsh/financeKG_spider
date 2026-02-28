@@ -19,7 +19,7 @@
                 - `id`：本公司 ID。
                 - `shareHolderType`：股东类型代码（例如2=企业法人、1=自然人等），`shareHolderTypeOnPage`为页面显示文字。
                 - `shareHolderName`、`alias`：股东名称和别名。
-                - `shareHolderNameId` / `shareHolderGid` / `shareHolderHid`：关联的股东实体ID。
+                - `shareHolderNameId` / `shareHolderGid` / `shareHolderHid` / `shareHolderPid`：NameId通常等于后三者中的非null值，Pid代表这是一个人，Gid和Hid的区别我猜测是机构/公司类型的不同ID体系。
                 - `percent`, `percent4Sort`, `percentChange`：持股比例及用于排序的数值。
                 - `indirectBenefitShares`、`finalBenefitShares`：间接/最终受益股份，通常"-"或数字。
                 - `logo`, `jigouLogo`、`productLogo`等：公司的标志链接。
@@ -30,3 +30,8 @@
                 - `subscribedDate`、`latestCapitalTime`、`capitalTotal`：出资时间信息。
                 - 还有诸多风险/状态字段（如`totalRisk`、`cluesOrRiskMsg`、`isShellCompany`等），根据天眼查页面返回的实时数据填充，可能为null。
                 - 其余字段多为后台业务或UI使用，可以在有需要时查看示例。
+
+
+- 特殊数据备忘（请结合 `neo4j_utils.py` 中的代码理解）：
+    - investments_xxx.json 中，有可能有 tags 为空，经核查，公司存在，然而是HK公司，天眼查是有数据的，但是在对外投资关系中天眼查未将其基础数据作为 tags 返回
+    - 
