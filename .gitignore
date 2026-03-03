@@ -68,3 +68,6 @@ htmlcov/
 
 # Ignore Python egg/cache metadata
 __pypackages__/
+
+# Node.js dependencies (frontend)
+web_app/frontend/node_modules/

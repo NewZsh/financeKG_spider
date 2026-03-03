@@ -12,6 +12,7 @@ import threading
 import flask
 import os
 import time
+import json
 from datetime import datetime
 
 from base_spider import ThreadSafeUniqueQueue, base_spider
@@ -156,10 +157,153 @@ def index():
     return html
 
 
-@app.route('/config')
+@app.route('/config', methods=['GET', 'POST'])
 def config():
-    """查看配置"""
-    return flask.jsonify(spider_instance.cfg)
+    """查看和修改配置"""
+    if flask.request.method == 'POST':
+        try:
+            # 尝试从 JSON body 或 form data 获取配置
+            if flask.request.is_json:
+                new_cfg = flask.request.json
+            else:
+                new_cfg_str = flask.request.form.get('config')
+                if not new_cfg_str:
+                     return flask.jsonify({"success": False, "error": "Missing config parameter"}), 400
+                new_cfg = json.loads(new_cfg_str)
+            
+            # 保存到文件
+            with open(spider_instance.cfg_file, 'w', encoding='utf-8') as f:
+                json.dump(new_cfg, f, indent=4, ensure_ascii=False)
+            
+            # 更新内存中的配置
+            spider_instance.cfg = new_cfg
+            
+            # 同时更新其他爬虫实例的配置，确保立即生效
+            for spider in [qxb_spider_instance, tyc_spider_instance]:
+                if hasattr(spider, 'cfg'):
+                    spider.cfg = new_cfg
+                    
+                    # 尝试更新 s_cfg (子类特定配置)
+                    spider_name = spider.__class__.__name__
+                    if hasattr(spider, 's_cfg') and spider_name in new_cfg:
+                        spider.s_cfg = new_cfg[spider_name]
+            
+            return flask.jsonify({"success": True, "message": "配置已更新，所有爬虫实例已同步"})
+        except Exception as e:
+            return flask.jsonify({"success": False, "error": str(e)}), 400
+
+    # GET 请求 - 返回带有编辑器的HTML页面
+    cfg_json = json.dumps(spider_instance.cfg, indent=4, ensure_ascii=False)
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>配置管理 - FinanceKG Spider</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1 {{ color: #333; }}
+            .editor-container {{ margin: 20px 0; }}
+            textarea {{ 
+                width: 100%; 
+                height: 600px; 
+                font-family: Consolas, 'Courier New', monospace; 
+                padding: 10px;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                font-size: 14px;
+                background-color: #fafafa;
+            }}
+            .actions {{ margin-top: 20px; }}
+            button {{ padding: 10px 20px; background: #0066cc; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }}
+            button:hover {{ background: #0052a3; }}
+            .back-link {{ margin-bottom: 20px; display: inline-block; }}
+            #status {{ margin-top: 15px; font-weight: bold; min-height: 24px; }}
+            .success {{ color: green; }}
+            .error {{ color: red; }}
+            a {{ color: #0066cc; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+        </style>
+    </head>
+    <body>
+        <a href="/" class="back-link">← 返回首页</a>
+        <h1>⚙️ 配置管理</h1>
+        
+        <div class="editor-container">
+            <textarea id="config-editor" spellcheck="false">{{cfg_json}}</textarea>
+        </div>
+        
+        <div class="actions">
+            <button onclick="saveConfig()">💾 保存配置</button>
+            <div id="status"></div>
+        </div>
+        
+        <script>
+            function saveConfig() {{
+                const editor = document.getElementById('config-editor');
+                const configStr = editor.value;
+                const statusDiv = document.getElementById('status');
+                const saveBtn = document.querySelector('button');
+                
+                // 本地校验 JSON 格式
+                try {{
+                    JSON.parse(configStr);
+                }} catch (e) {{
+                    statusDiv.innerHTML = '<span class="error">❌ JSON 格式错误: ' + e.message + '</span>';
+                    return;
+                }}
+                
+                statusDiv.innerHTML = '⏳ 保存中...';
+                saveBtn.disabled = true;
+                
+                const formData = new FormData();
+                formData.append('config', configStr);
+                
+                fetch('/config', {{
+                    method: 'POST',
+                    body: formData
+                }})
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.success) {{
+                        statusDiv.innerHTML = '<span class="success">✅ ' + data.message + '</span>';
+                        // 3秒后清除成功消息
+                        setTimeout(() => {{
+                             if (statusDiv.innerHTML.includes('✅')) statusDiv.innerHTML = '';
+                        }}, 3000);
+                    }} else {{
+                        statusDiv.innerHTML = '<span class="error">❌ ' + data.error + '</span>';
+                    }}
+                }})
+                .catch(error => {{
+                    statusDiv.innerHTML = '<span class="error">❌ 请求失败: ' + error.message + '</span>';
+                }})
+                .finally(() => {{
+                    saveBtn.disabled = false;
+                }});
+            }}
+            
+            // 支持 Tab 键缩进
+            document.getElementById('config-editor').addEventListener('keydown', function(e) {{
+                if (e.key == 'Tab') {{
+                    e.preventDefault();
+                    var start = this.selectionStart;
+                    var end = this.selectionEnd;
+                    
+                    // set textarea value to: text before caret + tab + text after caret
+                    this.value = this.value.substring(0, start) +
+                        "    " + this.value.substring(end);
+                    
+                    // put caret at right position again
+                    this.selectionStart = this.selectionEnd = start + 4;
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return html
 
 
 @app.route('/qxb_spider')

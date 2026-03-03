@@ -1,6 +1,4 @@
-# 基础依赖
 loguru==0.7.3
-# flask 3.x 尚不存在，使用最新稳定 2.x 版本
 flask>=2.3.0,<3.0
 selenium>=4.22.0,<=4.36.0
 lxml==6.0.2
@@ -8,7 +6,5 @@ aiohttp>=3.10.11,<=3.13.3
 requests>=2.32
 beautifulsoup4==4.14.3
 tqdm
-# 图数据库客户端，代码中使用 py2neo
+fastapi>=0.12.0,<=0.120.0
 py2neo
-
-# 如有其他依赖请补充

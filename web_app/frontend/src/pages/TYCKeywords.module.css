@@ -1,0 +1,157 @@
+.container {
+  max-width: 960px;
+  margin: 40px auto;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: #333;
+}
+
+.header {
+  border-bottom: 1px solid #eee;
+  padding-bottom: 16px;
+  margin-bottom: 24px;
+}
+
+.title {
+  font-size: 28px;
+  margin: 0;
+  color: #24292e;
+}
+
+.uploadSection {
+  background: white;
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.uploadTitle {
+  margin-top: 0;
+  margin-bottom: 16px;
+  font-size: 18px;
+}
+
+.fileInput {
+  margin-right: 12px;
+}
+
+.uploadBtn {
+  background-color: #2ea44f;
+  color: white;
+  border: 1px solid rgba(27,31,35,0.15);
+  border-radius: 6px;
+  padding: 6px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.uploadBtn:hover {
+  background-color: #2c974b;
+}
+
+.uploadBtn:disabled {
+  background-color: #94d3a2;
+  cursor: not-allowed;
+}
+
+.message {
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 6px;
+  background-color: #f0f8ff;
+  color: #0366d6;
+  border: 1px solid #c8e1ff;
+}
+
+.statsSection {
+  display: flex;
+  gap: 24px;
+  margin-bottom: 32px;
+}
+
+.statCard {
+  flex: 1;
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e1e4e8;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.statLabel {
+  display: block;
+  color: #586069;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.statValue {
+  font-size: 24px;
+  font-weight: 600;
+  color: #24292e;
+}
+
+.fileListSection {
+  background: white;
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.fileListTitle {
+  padding: 16px 24px;
+  margin: 0;
+  border-bottom: 1px solid #e1e4e8;
+  background-color: #f6f8fa;
+  font-size: 16px;
+}
+
+.fileList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.fileItem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 24px;
+  border-bottom: 1px solid #e1e4e8;
+}
+
+.fileItem:last-child {
+  border-bottom: none;
+}
+
+.fileItem:hover {
+  background-color: #f1f3f5;
+}
+
+.fileName {
+  font-family: monospace;
+  font-size: 14px;
+  color: #0366d6;
+}
+
+.deleteBtn {
+  background-color: #fafbfc;
+  color: #d73a49;
+  border: 1px solid rgba(27,31,35,0.15);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.deleteBtn:hover {
+  background-color: #d73a49;
+  color: white;
+  border-color: #d73a49;
+}
