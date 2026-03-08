@@ -37,7 +37,9 @@ Neo4j 是否会重复导入，取决于你导入数据的方式和 Cypher 语句
     MATCH (s {id: "股东ID"})-[r:SHAREHOLDER]->(c:Company) RETURN s, r, c;
 请将"股东ID"替换为实际的id。
 
-
+查询某个公司的多层关系：
+    MATCH path=(c:Company {id: 'company_id'})-[:INVEST*1..N]->(related) RETURN path
+请将'company_id'替换为实际的公司id，N为你想查询的关系层数。
 '''
 
 class Neo4jManager:
@@ -48,19 +50,19 @@ class Neo4jManager:
         self.graph.delete_all()
 
     def add_company(self, company_id, name):
-        node = Node("Company", id=company_id, name=name)
+        node = Node("Company", id=str(company_id), name=name)
         self.graph.merge(node, "Company", "id")
         return node
 
     def add_person(self, person_id, name):
-        node = Node("Person", id=person_id, name=name)
+        node = Node("Person", id=str(person_id), name=name)
         self.graph.merge(node, "Person", "id")
         return node
 
     def add_investment(self, investor_id, investee_id, percent=None):
         # lookup the company nodes by id so we can attach their names to the relationship
-        investor = self.graph.nodes.match("Company", id=investor_id).first()
-        investee = self.graph.nodes.match("Company", id=investee_id).first()
+        investor = self.graph.nodes.match("Company", id=str(investor_id)).first()
+        investee = self.graph.nodes.match("Company", id=str(investee_id)).first()
         if investor and investee:
             # add name properties so that the relationship is more readable in the browser
             rel = Relationship(
@@ -74,17 +76,17 @@ class Neo4jManager:
             self.graph.merge(rel)
         else:
             if not investor:
-                print(f"{investor_id} not found")
+                print(f"investor {investor_id} not found")
             if not investee:
-                print(f"{investee_id} not found")
+                print(f"investee {investee_id} not found")
 
     def add_shareholder(self, company_id, shareholder_id, shareholder_type="Company", percent=None):
         # resolve nodes so that we can include their names on the edge
-        company = self.graph.nodes.match("Company", id=company_id).first()
+        company = self.graph.nodes.match("Company", id=str(company_id)).first()
         if shareholder_type == "Company":
-            shareholder = self.graph.nodes.match("Company", id=shareholder_id).first()
+            shareholder = self.graph.nodes.match("Company", id=str(shareholder_id)).first()
         else:
-            shareholder = self.graph.nodes.match("Person", id=shareholder_id).first()
+            shareholder = self.graph.nodes.match("Person", id=str(shareholder_id)).first()
         if company and shareholder:
             rel = Relationship(
                 shareholder,
@@ -97,9 +99,9 @@ class Neo4jManager:
             self.graph.merge(rel)
         else:
             if not company:
-                print(f"{company_id} not found")
+                print(f"company {company_id} not found")
             if not shareholder:
-                print(f"{shareholder_id} not found")
+                print(f"shareholder {shareholder_id} not found")
 
     def get_graph_data(self, limit=100):
         # return a simplified structure with names alongside the raw nodes/relationships
@@ -129,7 +131,7 @@ class DataImporter:
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
                 data = json.load(f)
                 # 公司节点
-                company_id = str(data.get("id") or data.get("company_id"))
+                company_id = str(data.get("id") or data.get("company_id")) if (data.get("id") or data.get("company_id")) is not None else None
                 name = data.get("name")
                 if company_id and name:
                     self.neo4j_manager.add_company(company_id, name)
@@ -140,23 +142,27 @@ class DataImporter:
                 for line in f:
                     inv = json.loads(line)
 
-                    id1 = inv.get("id")
+                    id1 = str(inv.get("id")) if inv.get("id") is not None else None
                     tags = inv.get("tags", [{}])
                     if len(tags) == 0:
                         # print(f"invalid tags in file {file}") # 冗余检查，理解数据所用。事实上有可能是HK公司，天眼查是有数据的，但是在对外投资关系中天眼查未将其基础数据作为 tags 返回
                         tag = {}
                     else:
                         tag = tags[0]
-                    id2 = tag.get("companyId")
-                    if id1 and id2 and id1 != id2:
-                        raise ValueError(f"invalid data: id {id1} id2 {id2} in file {file}") # 冗余检查，如果二者皆有，没有发现不一致
+                    if "companyId" in tag:
+                        id2 = str(tag.get("companyId")) if tag.get("companyId") is not None else None
+                        if id1 != id2:
+                            # 确实有发现不一致，如data/tyc_data/investments_2350756110.json  line251, id:null, companyId:5508484910
+                            print(f"warning: id {id1} != companyId {id2} in file {file}, using companyId") 
+                        if id1 and id2 and id1 != id2:
+                            raise ValueError(f"invalid data: id {id1} id2 {id2} in file {file}") # 冗余检查，没进入过这一行，说明 id 和 companyId 至少有一个是空的，或者两者相等
 
-                    investee_id = inv.get("id")
+                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
                     if investee_id is None:
                         tags = inv.get("tags", [{}])
                         if len(tags) > 0:
                             tag = tags[0]
-                            investee_id = tag.get("companyId")
+                            investee_id = str(tag.get("companyId")) if tag.get("companyId") is not None else None
                     investee_name = inv.get("name")
                     if investee_id and investee_name:
                         self.neo4j_manager.add_company(investee_id, investee_name)
@@ -168,9 +174,9 @@ class DataImporter:
                     sh = json.loads(line)
                     shareholder_type = sh.get("shareHolderType")
                     if shareholder_type == 1: # 自然人股东
-                        shareholder_id = sh.get("shareHolderPid")
+                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
                     else: # 企业股东/其他
-                        shareholder_id = sh.get("shareHolderNameId")
+                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
                         
                     shareholder_name = sh.get("shareHolderName", "")
                     if shareholder_id and shareholder_name:
@@ -187,7 +193,12 @@ class DataImporter:
                 investor_id = file.split("_", 1)[1].split(".", 1)[0] # 从文件名中提取投资方ID
                 for line in f:
                     inv = json.loads(line)
-                    investee_id = inv.get("id")
+                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
+                    if investee_id is None:
+                        tags = inv.get("tags", [{}])
+                        if len(tags) > 0:
+                            tag = tags[0]
+                            investee_id = str(tag.get("companyId")) if tag.get("companyId") is not None else None
                     investee_name = inv.get("name")
                     percent = inv.get("totalPercent")
                     if investor_id and investee_id:
@@ -201,9 +212,9 @@ class DataImporter:
                     sh = json.loads(line)
                     shareholder_type = sh.get("shareHolderType")
                     if shareholder_type == 1: # 自然人股东
-                        shareholder_id = sh.get("shareHolderPid")
+                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
                     else: # 企业股东/其他
-                        shareholder_id = sh.get("shareHolderNameId")
+                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
                     percent = sh.get("percent")
                     shareholder_name = sh.get("shareHolderName", "")
                     if shareholder_id and shareholder_name:
