@@ -390,9 +390,10 @@ class TYCSpider(base_spider):
             # 可选：保存到文件（仅在本页有记录时写入，避免创建空文件）
             if save_to_file:
                 output_file = os.path.join(self.data_direc, f"shareholders_{company_gid}.json")
-                with open(output_file, 'a', encoding='utf-8') as f:
-                    for shareholder in shareholders:
-                        f.write(json.dumps(shareholder, ensure_ascii=False) + "\n")
+                with self.file_lock:
+                    with open(output_file, 'a', encoding='utf-8') as f:
+                        for shareholder in shareholders:
+                            f.write(json.dumps(shareholder, ensure_ascii=False) + "\n")
 
             self.logger.info(f"第 {page_num} 页获取 {len(shareholders)} 条记录，总共 {total} 条")
 
@@ -491,15 +492,18 @@ class TYCSpider(base_spider):
             # 可选：保存到文件（仅在本页有记录时写入，避免创建空文件）
             if save_to_file:
                 output_file = os.path.join(self.data_direc, f"investments_{company_gid}.json")
-                with open(output_file, 'a', encoding='utf-8') as f:
-                    for inv in investments:
-                        f.write(json.dumps(inv, ensure_ascii=False) + "\n")
-                for id, base_info in company_base_info_dict.items():
-                    id_found.add(id)
-                    output_file = os.path.join(self.data_direc, f"base_info_{id}.json")
-                    if not os.path.exists(output_file):
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            f.write(json.dumps(base_info, ensure_ascii=False) + "\n")
+                with self.file_lock:
+                    with open(output_file, 'a', encoding='utf-8') as f:
+                        for inv in investments:
+                            f.write(json.dumps(inv, ensure_ascii=False) + "\n")
+                
+                with self.file_lock:
+                    for id, base_info in company_base_info_dict.items():
+                        id_found.add(id)
+                        output_file = os.path.join(self.data_direc, f"base_info_{id}.json")
+                        if not os.path.exists(output_file):
+                            with open(output_file, 'w', encoding='utf-8') as f:
+                                f.write(json.dumps(base_info, ensure_ascii=False) + "\n")
 
             self.logger.info(f"第 {page_num} 页获取 {len(investments)} 条记录，总共 {total} 条")
             
@@ -614,25 +618,27 @@ class TYCSpider(base_spider):
                     
                     output_file = os.path.join(self.data_direc, f"base_info_{company_id}.json")
                     
-                    # 如果文件已存在，检查是不是存在creditCode
-                    if os.path.exists(output_file):
-                        with open(output_file, 'r', encoding='utf-8') as f:
-                            existing_data = json.load(f)
-                        if existing_data.get("creditCode"):
-                            self.logger.debug(f"文件 {output_file} 已存在，跳过")
-                            continue
-                    
-                    # 搜索带<em>标签的字段，去掉标签后保存
-                    if "name" in company:
-                        company["name"] = company["name"].replace("<em>", "").replace("</em>", "")
-
-                    try:
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            json.dump(company, f, ensure_ascii=False, indent=2)
-                        self.logger.debug(f"已保存: base_info_{company_id}.json")
-                        self.write_db(src="tyc", id=company_id, entity_type="1")
-                    except Exception as e:
-                        self.logger.error(f"保存文件失败: {output_file}, 错误: {e}")
+                    # 获取文件锁，防止并发问题
+                    with self.file_lock:
+                        # 如果文件已存在，检查是不是存在creditCode
+                        if os.path.exists(output_file):
+                            with open(output_file, 'r', encoding='utf-8') as f:
+                                existing_data = json.load(f)
+                            if existing_data.get("creditCode"):
+                                self.logger.debug(f"文件 {output_file} 已存在，跳过")
+                                continue
+                        
+                        # 搜索带<em>标签的字段，去掉标签后保存
+                        if "name" in company:
+                            company["name"] = company["name"].replace("<em>", "").replace("</em>", "")
+    
+                        try:
+                            with open(output_file, 'w', encoding='utf-8') as f:
+                                json.dump(company, f, ensure_ascii=False, indent=2)
+                            self.logger.debug(f"已保存: base_info_{company_id}.json")
+                            self.write_db(src="tyc", id=company_id, entity_type="1")
+                        except Exception as e:
+                            self.logger.error(f"保存文件失败: {output_file}, 错误: {e}")
             
             self.logger.info(f"第 {page_num} 页获取 {len(page_company_ids)} 条记录")
             

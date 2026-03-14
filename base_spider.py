@@ -69,6 +69,8 @@ class ThreadSafeUniqueQueue:
 
 
 class base_spider:
+    _global_file_lock = threading.Lock()  # 全局文件锁，防止不同爬虫实例多线程竞争写入
+
     def __init__(self, id_collect_queue = None):
         self.ua_list = [
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
@@ -83,7 +85,7 @@ class base_spider:
         self.batch_size = 100  # 每次处理的记录数
         self.update_buffer = []  # 更新缓冲区
         self.buffer_lock = threading.Lock()  # 缓冲区锁
-        self.file_lock = threading.Lock()  # 文件锁
+        self.file_lock = base_spider._global_file_lock  # 使用类级别的文件锁，防止跨爬虫实例的竞争
 
         # bind a loguru logger to this instance
         self.logger = logger.bind(spider=self.__class__.__name__)
@@ -154,8 +156,9 @@ class base_spider:
         '''
         try:
             old_cfg = self.cfg.copy() if hasattr(self, 'cfg') else None
-            with open(self.cfg_file, 'r') as f:
-                new_cfg = json.loads(f.read())
+            with self.file_lock:
+                with open(self.cfg_file, 'r') as f:
+                    new_cfg = json.loads(f.read())
             if old_cfg != new_cfg:
                 self.cfg = new_cfg
                 self.logger.info(f"配置变更，时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -167,8 +170,9 @@ class base_spider:
         '''
         Write current configuration to cfg file
         '''
-        with open(self.cfg_file, 'w') as f:
-            f.write(json.dumps(self.cfg, indent=4))
+        with self.file_lock:
+            with open(self.cfg_file, 'w') as f:
+                f.write(json.dumps(self.cfg, indent=4))
     
     def __start_cfg_refresh_timer(self):
         '''

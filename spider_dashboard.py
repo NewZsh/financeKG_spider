@@ -172,8 +172,9 @@ def config():
                 new_cfg = json.loads(new_cfg_str)
             
             # 保存到文件
-            with open(spider_instance.cfg_file, 'w', encoding='utf-8') as f:
-                json.dump(new_cfg, f, indent=4, ensure_ascii=False)
+            with spider_instance.file_lock:
+                with open(spider_instance.cfg_file, 'w', encoding='utf-8') as f:
+                    json.dump(new_cfg, f, indent=4, ensure_ascii=False)
             
             # 更新内存中的配置
             spider_instance.cfg = new_cfg
@@ -721,13 +722,16 @@ def _tyc_id_watcher(poll_interval=60):
 if __name__ == "__main__":
     port = 9000
 
-    watcher_thread = threading.Thread(target=_tyc_kw_watcher, args=(10,), daemon=True)
-    watcher_thread.start()
-    print("关键词监控已启动（后台线程）")
+    # 避免 Flask debug 模式下 Reloader 导致的双重进程并发：
+    # 只有在确认为 Werkzeug 的工作子进程（WERKZEUG_RUN_MAIN），或者非 debug 模式下，才启动后台监控。
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
+        watcher_thread = threading.Thread(target=_tyc_kw_watcher, args=(10,), daemon=True)
+        watcher_thread.start()
+        print("关键词监控已启动（后台线程）")
 
-    watcher_thread = threading.Thread(target=_tyc_id_watcher, args=(10,), daemon=True)
-    watcher_thread.start()
-    print("新id监控已启动（后台线程）")
+        watcher_thread = threading.Thread(target=_tyc_id_watcher, args=(10,), daemon=True)
+        watcher_thread.start()
+        print("新id监控已启动（后台线程）")
 
     print("=" * 60)
     print("🕷️  FinanceKG Spider Dashboard 启动中...")

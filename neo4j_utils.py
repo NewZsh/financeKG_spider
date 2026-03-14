@@ -138,54 +138,69 @@ class DataImporter:
         
         # 1.1 先把所有公司导入，再导入投资关系和股东关系
         for file in tqdm.tqdm(investment_files, desc="导入投资关系中的公司"):
-            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    inv = json.loads(line)
+            try:
+                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            inv = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(f"invalid json in file {os.path.join(self.data_dir, file)}: {line}")
+                            continue
 
-                    id1 = str(inv.get("id")) if inv.get("id") is not None else None
-                    tags = inv.get("tags", [{}])
-                    if len(tags) == 0:
-                        # print(f"invalid tags in file {file}") # 冗余检查，理解数据所用。事实上有可能是HK公司，天眼查是有数据的，但是在对外投资关系中天眼查未将其基础数据作为 tags 返回
-                        tag = {}
-                    else:
-                        tag = tags[0]
-                    if "companyId" in tag:
-                        id2 = str(tag.get("companyId")) if tag.get("companyId") is not None else None
-                        if id1 != id2:
-                            # 确实有发现不一致，如data/tyc_data/investments_2350756110.json  line251, id:null, companyId:5508484910
-                            print(f"warning: id {id1} != companyId {id2} in file {file}, using companyId") 
-                        if id1 and id2 and id1 != id2:
-                            raise ValueError(f"invalid data: id {id1} id2 {id2} in file {file}") # 冗余检查，没进入过这一行，说明 id 和 companyId 至少有一个是空的，或者两者相等
-
-                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
-                    if investee_id is None:
+                        id1 = str(inv.get("id")) if inv.get("id") is not None else None
                         tags = inv.get("tags", [{}])
-                        if len(tags) > 0:
-                            tag = tags[0]
-                            investee_id = str(tag.get("companyId")) if tag.get("companyId") is not None else None
-                    investee_name = inv.get("name")
-                    if investee_id and investee_name:
-                        self.neo4j_manager.add_company(investee_id, investee_name)
-                    else:
-                        print(f"invalid data: id {investee_id} name {investee_name} in file {file}") # 冗余检查，没进入过这一行，说明 id 和 name 都齐全
-        for file in tqdm.tqdm(shareholder_files, desc="导入股东关系中的公司和人物"):
-            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    sh = json.loads(line)
-                    shareholder_type = sh.get("shareHolderType")
-                    if shareholder_type == 1: # 自然人股东
-                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
-                    else: # 企业股东/其他
-                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
-                        
-                    shareholder_name = sh.get("shareHolderName", "")
-                    if shareholder_id and shareholder_name:
-                        if shareholder_type == 1:
-                            self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                        if len(tags) == 0:
+                            # print(f"invalid tags in file {file}") # 冗余检查，理解数据所用。事实上有可能是HK公司，天眼查是有数据的，但是在对外投资关系中天眼查未将其基础数据作为 tags 返回
+                            tag = {}
                         else:
-                            self.neo4j_manager.add_company(shareholder_id, shareholder_name)                            
-                    else:
-                        print(f"invalid data: id {shareholder_id} name {shareholder_name} in file {file}")
+                            tag = tags[0]
+                        if "companyId" in tag:
+                            id2 = str(tag.get("companyId")) if tag.get("companyId") is not None else None
+                            if id1 != id2:
+                                # 确实有发现不一致，如data/tyc_data/investments_2350756110.json  line251, id:null, companyId:5508484910
+                                print(f"warning: id {id1} != companyId {id2} in file {os.path.join(self.data_dir, file)}, using companyId") 
+                            if id1 and id2 and id1 != id2:
+                                raise ValueError(f"invalid data: id {id1} id2 {id2} in file {os.path.join(self.data_dir, file)}") # 冗余检查，没进入过这一行，说明 id 和 companyId 至少有一个是空的，或者两者相等
+
+                        investee_id = str(inv.get("id")) if inv.get("id") is not None else None
+                        if investee_id is None:
+                            tags = inv.get("tags", [{}])
+                            if len(tags) > 0:
+                                tag = tags[0]
+                                investee_id = str(tag.get("companyId")) if tag.get("companyId") is not None else None
+                        investee_name = inv.get("name")
+                        if investee_id and investee_name:
+                            self.neo4j_manager.add_company(investee_id, investee_name)
+                        else:
+                            print(f"invalid data: id {investee_id} name {investee_name} in file {os.path.join(self.data_dir, file)}") # 冗余检查，没进入过这一行，说明 id 和 name 都齐全
+            except Exception as e:
+                print(f"error processing file {os.path.join(self.data_dir, file)}: {e}")
+        for file in tqdm.tqdm(shareholder_files, desc="导入股东关系中的公司和人物"):
+            try:
+                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            sh = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(f"invalid json in file {os.path.join(self.data_dir, file)}: {line}")
+                            continue
+                        
+                        shareholder_type = sh.get("shareHolderType")
+                        if shareholder_type == 1: # 自然人股东
+                            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
+                        else: # 企业股东/其他
+                            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
+                            
+                        shareholder_name = sh.get("shareHolderName", "")
+                        if shareholder_id and shareholder_name:
+                            if shareholder_type == 1:
+                                self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                            else:
+                                self.neo4j_manager.add_company(shareholder_id, shareholder_name)                            
+                        else:
+                            print(f"invalid data: id {shareholder_id} name {shareholder_name} in file {file}")
+            except Exception as e:
+                print(f"error processing file {os.path.join(self.data_dir, file)}: {e}")
 
         # 2. 读取所有 investments_*.json 文件，导入投资关系
         for file in tqdm.tqdm(investment_files, desc="导入投资关系"):
