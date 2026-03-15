@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import G6 from '@antv/g6';
+import { Graph } from '@antv/g6';
 import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
 
@@ -17,7 +17,7 @@ const GraphView = () => {
     const width = containerRef.current.clientWidth;
     const height = 600;
     
-    const graph = new G6.Graph({
+    const graph = new Graph({
       container: containerRef.current,
       width,
       height,
@@ -44,18 +44,22 @@ const GraphView = () => {
     graphRef.current = graph;
 
     graph.on('node:dblclick', (e: any) => {
-      const clickedNodeId = e.item.getModel().id;
+      // In G6 v5, the clicked target exposes id as e.target.id
+      const clickedNodeId = e.target?.id || e.itemId || e.id;
+      if (!clickedNodeId) return;
+
       axios.get(`${API_BASE}/api/graph/company/${clickedNodeId}/graph?hops=2`)
         .then(({ data }) => {
-          const currentData = graphRef.current.save();
+          const currentData = graphRef.current.getData();
           
           const newNodes = data.nodes.filter((n: any) => !currentData.nodes?.find((cn: any) => cn.id === n.id));
           const newEdges = data.edges.filter((e: any) => !currentData.edges?.find((ce: any) => ce.source === e.source && ce.target === e.target));
           
-          graphRef.current.changeData({
-            nodes: [...(currentData.nodes || []), ...newNodes],
-            edges: [...(currentData.edges || []), ...newEdges]
+          graphRef.current.addData({
+            nodes: newNodes,
+            edges: newEdges
           });
+          graphRef.current.render();
         })
         .catch(err => console.error("Error expanding node:", err));
     });
@@ -64,12 +68,8 @@ const GraphView = () => {
       axios.get(`${API_BASE}/api/graph/company/${companyId}/graph`)
         .then((res) => {
           const graphData = res.data;
-          graph.data(graphData);
+          graph.setData(graphData);
           graph.render();
-          
-          graph.getNodes().forEach((node: any) => {
-              graph.setItemState(node, 'normal', true);
-          });
         })
         .catch(err => console.error("Error fetching initial graph:", err));
     }

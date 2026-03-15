@@ -32,7 +32,6 @@ export default function Home() {
     <div className={styles.dashboard}>
       <div className={styles.center}>
         <h1 className={styles.title}>🕷️ FinanceKG Spider Dashboard</h1>
-        <p className={styles.subtitle}>全新 Web 仪表盘，前后端分离，数据可视化与管理</p>
       </div>
 
       {/* 查询图谱区 */}

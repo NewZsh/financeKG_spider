@@ -2,9 +2,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from .api import tasks, tyc, config, qxb, graph
+from .services.background_tasks import start_background_tasks
 import os
 
 app = FastAPI()
+
+# 启动后台爬虫监控线程
+@app.on_event("startup")
+async def startup_event():
+    start_background_tasks()
 
 # CORS - allow frontend dev server or any origin in production
 app.add_middleware(

@@ -48,7 +48,7 @@ def format_neo4j_data_to_graph(records):
     }
 
 @router.get("/search")
-async def search_companies(keyword: str):
+def search_companies(keyword: str):
     query = """
     MATCH (c:Company)
     WHERE c.name CONTAINS $keyword
@@ -58,7 +58,7 @@ async def search_companies(keyword: str):
     return {"results": res}
 
 @router.get("/company/{company_id}/graph")
-async def get_company_graph(company_id: str, hops: int = 2):
+def get_company_graph(company_id: str, hops: int = 2):
     query = """
     MATCH path = (c {id: $company_id})-[*1..2]-(m)
     WITH nodes(path) AS ns, relationships(path) AS rs
@@ -70,7 +70,7 @@ async def get_company_graph(company_id: str, hops: int = 2):
     return format_neo4j_data_to_graph(res) 
 
 @router.get("/examples")
-async def get_example_companies():
+def get_example_companies():
     query = "MATCH (c:Company) RETURN c.id AS id, c.name AS name LIMIT 10"
     res = neo4j_mgr.graph.run(query).data()
     return {"examples": res}
