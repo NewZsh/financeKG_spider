@@ -63,9 +63,41 @@ class Neo4jManager:
     
     def query_company_id(self, company_id):
         return self.graph.nodes.match("Company", id=str(company_id)).first()
+
+    def query_companies_by_name(self, keywords, limit=20):
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        keywords = [keyword.strip() for keyword in keywords if keyword and keyword.strip()]
+        if not keywords:
+            return []
+
+        query = '''
+        MATCH (c:Company)
+        WHERE ANY(keyword IN $keywords WHERE toLower(c.name) CONTAINS toLower(keyword))
+        RETURN c.id AS id, c.name AS name
+        ORDER BY c.name
+        LIMIT $limit
+        '''
+        return self.graph.run(query, keywords=keywords, limit=limit).data()
     
     def query_person_id(self, person_id):
         return self.graph.nodes.match("Person", id=str(person_id)).first()
+
+    def query_persons_by_name(self, keywords, limit=20):
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        keywords = [keyword.strip() for keyword in keywords if keyword and keyword.strip()]
+        if not keywords:
+            return []
+
+        query = '''
+        MATCH (p:Person)
+        WHERE ANY(keyword IN $keywords WHERE toLower(p.name) CONTAINS toLower(keyword))
+        RETURN p.id AS id, p.name AS name
+        ORDER BY p.name
+        LIMIT $limit
+        '''
+        return self.graph.run(query, keywords=keywords, limit=limit).data()
 
     def add_investment(self, investor_id, investee_id, percent=None):
         # assume that the investor deem to exist
@@ -177,6 +209,7 @@ class DataImporter:
         self.neo4j_manager = neo4j_manager
         self.data_dir = data_dir
         self.batch_size = 5000
+        self.queue_maxsize = 1
 
     def _writer_worker(self, q, write_method):
         while True:
@@ -195,22 +228,21 @@ class DataImporter:
 
     def import_all(self):
         '''
-        使用多线程、双队列的方式，分三步导入数据：
+        分三步导入数据：
         1. 导入节点：先从 base_info 导入公司节点，再从 investments 和 shareholders 导入公司和自然人节点
         2. 导入投资关系：从 investments 导入公司之间的投资关系
         3. 导入股东关系：从 shareholders 导入公司与股东（公司或自然人）之间的股东关系
 
-        双队列的工作方式：
-        - 两个队列的max size = 2, 其中一个当主线程积累到 batch_size 条数据时放入队列，另一个线程从队列中取出数据并调用 Neo4jManager 的批量写入方法，
-            此时主线程可以继续读取文件并积累数据，写入 Neo4jManager 操作正在执行的时候，读文件的线程不会被阻塞，它可以继续往另一个 List（即队列中）猛塞数据。
+        队列的工作方式：当主线程积累到 batch_size 条数据时放入队列，写线程从队列中取出数据并调用 Neo4jManager 的批量写入方法。
+            这样可以让主线程在写线程处理当前批次时继续读取并积累下一批数据；如果写线程跟不上，主线程会在下一次 put 时阻塞，避免内存里堆积过多待写批次。
         '''
         base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
         investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
         shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")][:1000]
 
         # --- 第一步：并发导5入公司和自然人节点 ---
-        q_co = queue.Queue(maxsize=2)
-        q_per = queue.Queue(maxsize=2)
+        q_co = queue.Queue(maxsize=self.queue_maxsize)
+        q_per = queue.Queue(maxsize=self.queue_maxsize)
         
         t_co = threading.Thread(target=self._writer_worker, args=(q_co, self.neo4j_manager.add_companies_unwind_batch))
         t_per = threading.Thread(target=self._writer_worker, args=(q_per, self.neo4j_manager.add_persons_unwind_batch))
@@ -227,7 +259,7 @@ class DataImporter:
                 data = json.load(f)
                 company_id = str(data.get("id") or data.get("company_id")) if (data.get("id") or data.get("company_id")) is not None else None
                 if not company_id:
-                    company_id = file.split("_", 1)[1].split(".", 1)[0]
+                    company_id = file.rsplit("_", 1)[1].split(".", 1)[0]
                 name = data.get("name")
                 if company_id and name:
                     co_batch.append({"id": company_id, "name": name})
@@ -297,7 +329,7 @@ class DataImporter:
         t_per.join()
 
         # --- 第二步：并发导入投资关系 ---
-        q_inv = queue.Queue(maxsize=2)
+        q_inv = queue.Queue(maxsize=self.queue_maxsize)
         t_inv = threading.Thread(target=self._writer_worker, args=(q_inv, self.neo4j_manager.add_investments_unwind_batch))
         t_inv.start()
         
@@ -331,7 +363,7 @@ class DataImporter:
         t_inv.join()
 
         # --- 第三步：并发导入股东关系 ---
-        q_sh = queue.Queue(maxsize=2)
+        q_sh = queue.Queue(maxsize=self.queue_maxsize)
         t_sh = threading.Thread(target=self._writer_worker, args=(q_sh, self.neo4j_manager.add_shareholders_unwind_batch))
         t_sh.start()
 
@@ -365,6 +397,119 @@ class DataImporter:
         self._flush_queue(q_sh, sh_batch)
         t_sh.join()
 
+    def import_all_one_by_one(self):
+        '''
+        单线程逐条导入版本，用于和批量导入的速度做对比。
+        导入顺序与 import_all 保持一致，只是不再使用队列和批量写入。
+        '''
+        base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
+        investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
+        shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")][:1000]
+
+        # 1.1 从 base_info 导入公司
+        for file in tqdm.tqdm(base_info_files, desc="逐条导入公司信息"):
+            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                data = json.load(f)
+                company_id = str(data.get("id") or data.get("company_id")) if (data.get("id") or data.get("company_id")) is not None else None
+                if not company_id:
+                    company_id = file.rsplit("_", 1)[1].split(".", 1)[0]
+                name = data.get("name")
+                if company_id and name:
+                    self.neo4j_manager.add_company(company_id, name)
+
+        # 1.2 从 investments 导入公司
+        for file in tqdm.tqdm(investment_files, desc="逐条导入投资关系中的公司"):
+            try:
+                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            inv = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        investee_id = str(inv.get("id")) if inv.get("id") is not None else None
+                        if investee_id is None:
+                            tags = inv.get("tags", [{}])
+                            if len(tags) > 0:
+                                investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
+                        investee_name = inv.get("name")
+                        if investee_id and investee_name:
+                            self.neo4j_manager.add_company(investee_id, investee_name)
+            except Exception:
+                pass
+
+        # 1.3 从 shareholders 导入公司和人物
+        for file in tqdm.tqdm(shareholder_files, desc="逐条导入股东关系中的公司和人物"):
+            try:
+                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            sh = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        shareholder_type = sh.get("shareHolderType")
+                        if shareholder_type == 1:
+                            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
+                        else:
+                            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
+
+                        shareholder_name = sh.get("shareHolderName", "")
+                        if shareholder_id and shareholder_name:
+                            if shareholder_type == 1:
+                                self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                            else:
+                                self.neo4j_manager.add_company(shareholder_id, shareholder_name)
+            except Exception:
+                pass
+
+        # 2. 从 investments 导入投资关系
+        for file in tqdm.tqdm(investment_files, desc="逐条导入投资关系"):
+            investor_id = file.split("_", 1)[1].split(".", 1)[0]
+            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        inv = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
+                    if investee_id is None:
+                        tags = inv.get("tags", [{}])
+                        if len(tags) > 0:
+                            investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
+                    percent = inv.get("totalPercent")
+
+                    if investor_id and investee_id:
+                        self.neo4j_manager.add_investment(investor_id, investee_id, percent)
+
+        # 3. 从 shareholders 导入股东关系
+        for file in tqdm.tqdm(shareholder_files, desc="逐条导入股东关系"):
+            company_id = file.split("_", 1)[1].split(".", 1)[0]
+            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        sh = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    shareholder_type = sh.get("shareHolderType")
+                    if shareholder_type == 1:
+                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
+                        shareholder_type_name = "Person"
+                    else:
+                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
+                        shareholder_type_name = "Company"
+                    percent = sh.get("percent")
+
+                    if company_id and shareholder_id:
+                        self.neo4j_manager.add_shareholder(
+                            company_id,
+                            shareholder_id,
+                            shareholder_type=shareholder_type_name,
+                            percent=percent,
+                        )
+
 if __name__ == "__main__":
     """
     主函数：批量导入 data/tyc_data 下的数据到 Neo4j。
@@ -377,7 +522,8 @@ if __name__ == "__main__":
     neo4j_manager.flush_db()
     
     importer = DataImporter(neo4j_manager, data_dir=data_dir)
-    importer.import_all()
+    # importer.import_all()
+    importer.import_all_one_by_one()  # 逐条导入版本，测试用
     print("数据导入完成！")
     print("\n【如何在网页端查看数据】")
     print("1. 启动 Neo4j Desktop 或 Neo4j 服务，确保数据库已运行。")
