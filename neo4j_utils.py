@@ -47,6 +47,14 @@ Neo4j 是否会重复导入，取决于你导入数据的方式和 Cypher 语句
 class Neo4jManager:
     def __init__(self, uri="neo4j://localhost:7687", user="neo4j", password="83939190ys"):
         self.graph = Graph(uri, auth=(user, password))
+
+    def ensure_constraints(self):
+        queries = [
+            "CREATE CONSTRAINT company_id_unique IF NOT EXISTS FOR (c:Company) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT person_id_unique IF NOT EXISTS FOR (p:Person) REQUIRE p.id IS UNIQUE",
+        ]
+        for query in queries:
+            self.graph.run(query)
     
     def flush_db(self):
         self.graph.delete_all()
@@ -159,8 +167,10 @@ class Neo4jManager:
         if not batch_data: return
         query = '''
         UNWIND $batch AS row
-        MATCH (investor:Company {id: row.investor_id})
-        MATCH (investee:Company {id: row.investee_id})
+        MERGE (investor:Company {id: row.investor_id})
+        SET investor.name = coalesce(investor.name, row.investor_name)
+        MERGE (investee:Company {id: row.investee_id})
+        SET investee.name = coalesce(investee.name, row.investee_name)
         MERGE (investor)-[r:INVEST]->(investee)
         SET r.percent = row.percent
         '''
@@ -211,6 +221,47 @@ class DataImporter:
         self.batch_size = 5000
         self.queue_maxsize = 1
 
+    def _iter_json_lines(self, file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            try:
+                for line in f:
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"Error reading file {file_path}: {e}")
+
+    def _queue_batch(self, q, batch):
+        if len(batch) >= self.batch_size:
+            q.put(batch)
+            return []
+        return batch
+
+    def _append_unique_node(self, batch, seen_ids, node_id, name, q):
+        if not node_id or not name or node_id in seen_ids:
+            return batch
+        seen_ids.add(node_id)
+        batch.append({"id": node_id, "name": name})
+        return self._queue_batch(q, batch)
+
+    def _extract_investment_fields(self, inv):
+        investee_id = str(inv.get("id")) if inv.get("id") is not None else None
+        if investee_id is None:
+            tags = inv.get("tags") or []
+            if tags:
+                company_id = tags[0].get("companyId")
+                investee_id = str(company_id) if company_id is not None else None
+        return investee_id, inv.get("name"), inv.get("totalPercent")
+
+    def _extract_shareholder_fields(self, sh):
+        shareholder_type = sh.get("shareHolderType")
+        if shareholder_type == 1:
+            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
+        else:
+            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
+        return shareholder_type, shareholder_id, sh.get("shareHolderName", ""), sh.get("percent")
+
     def _writer_worker(self, q, write_method):
         while True:
             batch = q.get()
@@ -252,6 +303,8 @@ class DataImporter:
 
         co_batch = []
         per_batch = []
+        seen_company_ids = set()
+        seen_person_ids = set()
 
         # 1.1 从 base_info 导入公司
         for file in tqdm.tqdm(base_info_files, desc="导入公司信息"):
@@ -261,68 +314,19 @@ class DataImporter:
                 if not company_id:
                     company_id = file.rsplit("_", 1)[1].split(".", 1)[0]
                 name = data.get("name")
-                if company_id and name:
-                    co_batch.append({"id": company_id, "name": name})
-                    if len(co_batch) >= self.batch_size:
-                        q_co.put(co_batch)
-                        co_batch = []
+                co_batch = self._append_unique_node(co_batch, seen_company_ids, company_id, name, q_co)
 
-        # 1.2 从 investments 导入公司
-        for file in tqdm.tqdm(investment_files, desc="导入投资关系中的公司"):
-            try:
-                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            inv = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        investee_id = str(inv.get("id")) if inv.get("id") is not None else None
-                        if investee_id is None:
-                            tags = inv.get("tags", [{}])
-                            if len(tags) > 0:
-                                investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
-                        investee_name = inv.get("name")
-                        if investee_id and investee_name:
-                            co_batch.append({"id": investee_id, "name": investee_name})
-                            if len(co_batch) >= self.batch_size:
-                                q_co.put(co_batch)
-                                co_batch = []
-            except Exception as e:
-                pass
-
-        # 1.3 从 shareholders 导入公司和人物
+        # 1.2 从 shareholders 导入公司和人物
         for file in tqdm.tqdm(shareholder_files, desc="导入股东关系中的公司和人物"):
-            try:
-                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            sh = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        
-                        shareholder_type = sh.get("shareHolderType")
-                        if shareholder_type == 1:
-                            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
-                        else:
-                            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
-                            
-                        shareholder_name = sh.get("shareHolderName", "")
-                        if shareholder_id and shareholder_name:
-                            if shareholder_type == 1:
-                                per_batch.append({"id": shareholder_id, "name": shareholder_name})
-                                if len(per_batch) >= self.batch_size:
-                                    q_per.put(per_batch)
-                                    per_batch = []
-                            else:
-                                co_batch.append({"id": shareholder_id, "name": shareholder_name})
-                                if len(co_batch) >= self.batch_size:
-                                    q_co.put(co_batch)
-                                    co_batch = []
-            except Exception as e:
-                pass
+            file_path = os.path.join(self.data_dir, file)
+            for sh in self._iter_json_lines(file_path):
+                shareholder_type, shareholder_id, shareholder_name, _ = self._extract_shareholder_fields(sh)
+                if shareholder_type == 1:
+                    per_batch = self._append_unique_node(per_batch, seen_person_ids, shareholder_id, shareholder_name, q_per)
+                else:
+                    co_batch = self._append_unique_node(co_batch, seen_company_ids, shareholder_id, shareholder_name, q_co)
 
-        # 刷新队列，等待所有节点导入完成
+        # 等待所有节点导入完成
         self._flush_queue(q_co, co_batch)
         self._flush_queue(q_per, per_batch)
         t_co.join()
@@ -336,28 +340,18 @@ class DataImporter:
         inv_batch = []
         for file in tqdm.tqdm(investment_files, desc="导入投资关系"):
             investor_id = file.split("_", 1)[1].split(".", 1)[0]
-            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        inv = json.loads(line)
-                    except:
-                        continue
-                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
-                    if investee_id is None:
-                        tags = inv.get("tags", [{}])
-                        if len(tags) > 0:
-                            investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
-                    percent = inv.get("totalPercent")
-                    
-                    if investor_id and investee_id:
-                        inv_batch.append({
-                            "investor_id": investor_id,
-                            "investee_id": investee_id,
-                            "percent": percent
-                        })
-                        if len(inv_batch) >= self.batch_size:
-                            q_inv.put(inv_batch)
-                            inv_batch = []
+            file_path = os.path.join(self.data_dir, file)
+            for inv in self._iter_json_lines(file_path):
+                investee_id, investee_name, percent = self._extract_investment_fields(inv)
+                if investor_id and investee_id:
+                    inv_batch.append({
+                        "investor_id": investor_id,
+                        "investee_id": investee_id,
+                        "investee_name": investee_name,
+                        "investor_name": None,
+                        "percent": percent
+                    })
+                    inv_batch = self._queue_batch(q_inv, inv_batch)
         
         self._flush_queue(q_inv, inv_batch)
         t_inv.join()
@@ -371,28 +365,31 @@ class DataImporter:
         for file in tqdm.tqdm(shareholder_files, desc="导入股东关系"):
             company_id = file.split("_", 1)[1].split(".", 1)[0]
             with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        sh = json.loads(line)
-                    except:
-                        continue
-                    shareholder_type = sh.get("shareHolderType")
-                    if shareholder_type == 1:
-                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
-                    else:
-                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
-                    percent = sh.get("percent")
-                    
-                    if company_id and shareholder_id:
-                        sh_batch.append({
-                            "company_id": company_id,
-                            "shareholder_id": shareholder_id,
-                            "shareholder_type": shareholder_type,
-                            "percent": percent
-                        })
-                        if len(sh_batch) >= self.batch_size:
-                            q_sh.put(sh_batch)
-                            sh_batch = []
+                try:
+                    for line in f:
+                        try:
+                            sh = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        shareholder_type = sh.get("shareHolderType")
+                        if shareholder_type == 1:
+                            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
+                        else:
+                            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
+                        percent = sh.get("percent")
+                        
+                        if company_id and shareholder_id:
+                            sh_batch.append({
+                                "company_id": company_id,
+                                "shareholder_id": shareholder_id,
+                                "shareholder_type": shareholder_type,
+                                "percent": percent
+                            })
+                            if len(sh_batch) >= self.batch_size:
+                                q_sh.put(sh_batch)
+                                sh_batch = []
+                except Exception as e:
+                    print(f"Error reading file {file_path}: {e}")
 
         self._flush_queue(q_sh, sh_batch)
         t_sh.join()
@@ -417,98 +414,43 @@ class DataImporter:
                 if company_id and name:
                     self.neo4j_manager.add_company(company_id, name)
 
-        # 1.2 从 investments 导入公司
-        for file in tqdm.tqdm(investment_files, desc="逐条导入投资关系中的公司"):
-            try:
-                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            inv = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        investee_id = str(inv.get("id")) if inv.get("id") is not None else None
-                        if investee_id is None:
-                            tags = inv.get("tags", [{}])
-                            if len(tags) > 0:
-                                investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
-                        investee_name = inv.get("name")
-                        if investee_id and investee_name:
-                            self.neo4j_manager.add_company(investee_id, investee_name)
-            except Exception:
-                pass
-
-        # 1.3 从 shareholders 导入公司和人物
+        # 1.2 从 shareholders 导入公司和人物
         for file in tqdm.tqdm(shareholder_files, desc="逐条导入股东关系中的公司和人物"):
-            try:
-                with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            sh = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        shareholder_type = sh.get("shareHolderType")
-                        if shareholder_type == 1:
-                            shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
-                        else:
-                            shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
-
-                        shareholder_name = sh.get("shareHolderName", "")
-                        if shareholder_id and shareholder_name:
-                            if shareholder_type == 1:
-                                self.neo4j_manager.add_person(shareholder_id, shareholder_name)
-                            else:
-                                self.neo4j_manager.add_company(shareholder_id, shareholder_name)
-            except Exception:
-                pass
+            file_path = os.path.join(self.data_dir, file)
+            for sh in self._iter_json_lines(file_path):
+                shareholder_type, shareholder_id, shareholder_name, _ = self._extract_shareholder_fields(sh)
+                if shareholder_id and shareholder_name:
+                    if shareholder_type == 1:
+                        self.neo4j_manager.add_person(shareholder_id, shareholder_name)
+                    else:
+                        self.neo4j_manager.add_company(shareholder_id, shareholder_name)
 
         # 2. 从 investments 导入投资关系
         for file in tqdm.tqdm(investment_files, desc="逐条导入投资关系"):
             investor_id = file.split("_", 1)[1].split(".", 1)[0]
-            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        inv = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    investee_id = str(inv.get("id")) if inv.get("id") is not None else None
-                    if investee_id is None:
-                        tags = inv.get("tags", [{}])
-                        if len(tags) > 0:
-                            investee_id = str(tags[0].get("companyId")) if tags[0].get("companyId") is not None else None
-                    percent = inv.get("totalPercent")
-
-                    if investor_id and investee_id:
-                        self.neo4j_manager.add_investment(investor_id, investee_id, percent)
+            file_path = os.path.join(self.data_dir, file)
+            for inv in self._iter_json_lines(file_path):
+                investee_id, investee_name, percent = self._extract_investment_fields(inv)
+                if investee_id and investee_name:
+                    self.neo4j_manager.add_company(investee_id, investee_name)
+                if investor_id and investee_id:
+                    self.neo4j_manager.add_investment(investor_id, investee_id, percent)
 
         # 3. 从 shareholders 导入股东关系
         for file in tqdm.tqdm(shareholder_files, desc="逐条导入股东关系"):
             company_id = file.split("_", 1)[1].split(".", 1)[0]
-            with open(os.path.join(self.data_dir, file), "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        sh = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            file_path = os.path.join(self.data_dir, file)
+            for sh in self._iter_json_lines(file_path):
+                shareholder_type, shareholder_id, _, percent = self._extract_shareholder_fields(sh)
+                shareholder_type_name = "Person" if shareholder_type == 1 else "Company"
 
-                    shareholder_type = sh.get("shareHolderType")
-                    if shareholder_type == 1:
-                        shareholder_id = str(sh.get("shareHolderPid")) if sh.get("shareHolderPid") is not None else None
-                        shareholder_type_name = "Person"
-                    else:
-                        shareholder_id = str(sh.get("shareHolderNameId")) if sh.get("shareHolderNameId") is not None else None
-                        shareholder_type_name = "Company"
-                    percent = sh.get("percent")
-
-                    if company_id and shareholder_id:
-                        self.neo4j_manager.add_shareholder(
-                            company_id,
-                            shareholder_id,
-                            shareholder_type=shareholder_type_name,
-                            percent=percent,
-                        )
+                if company_id and shareholder_id:
+                    self.neo4j_manager.add_shareholder(
+                        company_id,
+                        shareholder_id,
+                        shareholder_type=shareholder_type_name,
+                        percent=percent,
+                    )
 
 if __name__ == "__main__":
     """
@@ -520,10 +462,11 @@ if __name__ == "__main__":
     print("开始导入数据到 Neo4j...")
     neo4j_manager = Neo4jManager()
     neo4j_manager.flush_db()
+    neo4j_manager.ensure_constraints()
     
     importer = DataImporter(neo4j_manager, data_dir=data_dir)
-    # importer.import_all()
-    importer.import_all_one_by_one()  # 逐条导入版本，测试用
+    importer.import_all()
+    # importer.import_all_one_by_one()  # 逐条导入版本，测试用
     print("数据导入完成！")
     print("\n【如何在网页端查看数据】")
     print("1. 启动 Neo4j Desktop 或 Neo4j 服务，确保数据库已运行。")
