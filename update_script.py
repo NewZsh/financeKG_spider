@@ -1,110 +1,15 @@
-from py2neo import Graph, Node, Relationship
 import os
-import json
-import tqdm
-import queue
-import threading
+import re
 
-'''
-Neo4j 使用的 tips
+file_path = r"d:\work\financeKG_spider\neo4j_utils.py"
+with open(file_path, "r", encoding="utf-8") as f:
+    content = f.read()
 
-1. 规避重复导入
-Neo4j 是否会重复导入，取决于你导入数据的方式和 Cypher 语句的写法：
+# Insert queue and threading imports
+content = content.replace("import tqdm\n", "import tqdm\nimport queue\nimport threading\n")
 
-如果你用 Cypher 的 CREATE 语句直接插入节点或关系，每次执行都会新建，不会自动去重，因此会重复导入。
-如果你用 MERGE 语句，Neo4j 会根据你指定的唯一属性（如 id、name 等）查找是否已存在，存在则不会重复导入，不存在才会新建。
-如果你用 LOAD CSV 或类似批量导入工具，行为同上，取决于你用的是 CREATE 还是 MERGE。
-总结：
-
-用 CREATE 会重复导入。
-用 MERGE 并指定唯一属性，不会重复导入。
-如需避免重复，建议用 MERGE 并为节点/关系设置唯一约束（UNIQUE CONSTRAINT）。
-
-2. 查询语句
-
-查询所有公司节点（Company）：
-    MATCH (c:Company) RETURN c LIMIT 20;
-
-查询所有人物节点（Person）：
-    MATCH (p:Person) RETURN p LIMIT 20;
-
-查询所有公司之间的投资关系（INVEST）：
-    MATCH (a:Company)-[r:INVEST]->(b:Company) RETURN a, r, b LIMIT 20;
-
-查询某个公司及其所有股东（SHAREHOLDER）：
-    MATCH (s)-[r:SHAREHOLDER]->(c:Company {id: "公司ID"}) RETURN s, r, c;
-请将"公司ID"替换为实际的公司id。
-
-查询某个人或公司作为股东的所有公司：
-    MATCH (s {id: "股东ID"})-[r:SHAREHOLDER]->(c:Company) RETURN s, r, c;
-请将"股东ID"替换为实际的id。
-
-查询某个公司的多层关系：
-    MATCH path=(c:Company {id: 'company_id'})-[:INVEST*1..N]->(related) RETURN path
-请将'company_id'替换为实际的公司id，N为你想查询的关系层数。
-'''
-
-class Neo4jManager:
-    def __init__(self, uri="neo4j://localhost:7687", user="neo4j", password="83939190ys"):
-        self.graph = Graph(uri, auth=(user, password))
-    
-    def flush_db(self):
-        self.graph.delete_all()
-
-    def add_company(self, company_id, name):
-        node = Node("Company", id=str(company_id), name=name)
-        self.graph.merge(node, "Company", "id")
-        return node
-
-    def add_person(self, person_id, name):
-        node = Node("Person", id=str(person_id), name=name)
-        self.graph.merge(node, "Person", "id")
-        return node
-    
-    def query_company_id(self, company_id):
-        return self.graph.nodes.match("Company", id=str(company_id)).first()
-    
-    def query_person_id(self, person_id):
-        return self.graph.nodes.match("Person", id=str(person_id)).first()
-
-    def add_investment(self, investor_id, investee_id, percent=None):
-        # assume that the investor deem to exist
-        investor = self.query_company_id(investor_id)
-        investee = self.query_company_id(investee_id)
-        if investee:
-            # add name properties so that the relationship is more readable in the browser
-            rel = Relationship(
-                investor,
-                "INVEST",
-                investee,
-                percent=percent,
-                investor_name=investor.get("name"),
-                investee_name=investee.get("name"),
-            )
-            self.graph.merge(rel)
-        else:
-            print(f"investee {investee_id} not found")
-
-    def add_shareholder(self, company_id, shareholder_id, shareholder_type="Company", percent=None):
-        # assume that the company deem to exist
-        company = self.query_company_id(company_id)
-        if shareholder_type == "Company":
-            shareholder = self.query_company_id(shareholder_id)
-        else:
-            shareholder = self.query_person_id(shareholder_id)
-        if shareholder:
-            rel = Relationship(
-                shareholder,
-                "SHAREHOLDER",
-                company,
-                percent=percent,
-                shareholder_name=shareholder.get("name"),
-                company_name=company.get("name"),
-            )
-            self.graph.merge(rel)
-        else:
-            print(f"shareholder {shareholder_id} not found")
-
+# Setup the new batch methods in Neo4jManager
+manager_batch_methods = """
     def add_companies_unwind_batch(self, batch_data):
         if not batch_data: return
         query = '''
@@ -159,20 +64,13 @@ class Neo4jManager:
             '''
             self.graph.run(q_company, batch=company_batch)
 
-    def get_graph_data(self, limit=100):
-        # return a simplified structure with names alongside the raw nodes/relationships
-        query = """
-        MATCH (a)-[r]->(b)
-        RETURN a.id AS a_id, a.name AS a_name,
-               r AS relationship,
-               b.id AS b_id, b.name AS b_name
-        LIMIT $limit
-        """
-        return self.graph.run(query, limit=limit).data()
+    def get_graph_data(self, limit=100):"""
 
-## 读取 data/tyc_data 下的 base_info_{id}.json \ investments_{id}.json \ shareholders_{id}.json 文件，写入 Neo4j 图数据库
+content = content.replace("    def get_graph_data(self, limit=100):", manager_batch_methods)
 
-class DataImporter:
+
+# Rewrite DataImporter
+new_data_importer = """class DataImporter:
     def __init__(self, neo4j_manager, data_dir="data/tyc_data"):
         self.neo4j_manager = neo4j_manager
         self.data_dir = data_dir
@@ -194,21 +92,11 @@ class DataImporter:
         q.join()
 
     def import_all(self):
-        '''
-        使用多线程、双队列的方式，分三步导入数据：
-        1. 导入节点：先从 base_info 导入公司节点，再从 investments 和 shareholders 导入公司和自然人节点
-        2. 导入投资关系：从 investments 导入公司之间的投资关系
-        3. 导入股东关系：从 shareholders 导入公司与股东（公司或自然人）之间的股东关系
-
-        双队列的工作方式：
-        - 两个队列的max size = 2, 其中一个当主线程积累到 batch_size 条数据时放入队列，另一个线程从队列中取出数据并调用 Neo4jManager 的批量写入方法，
-            此时主线程可以继续读取文件并积累数据，写入 Neo4jManager 操作正在执行的时候，读文件的线程不会被阻塞，它可以继续往另一个 List（即队列中）猛塞数据。
-        '''
         base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
         investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
         shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")][:1000]
 
-        # --- 第一步：并发导5入公司和自然人节点 ---
+        # --- 第一步：并发导入公司和自然人节点 ---
         q_co = queue.Queue(maxsize=2)
         q_per = queue.Queue(maxsize=2)
         
@@ -365,24 +253,11 @@ class DataImporter:
         self._flush_queue(q_sh, sh_batch)
         t_sh.join()
 
-if __name__ == "__main__":
-    """
-    主函数：批量导入 data/tyc_data 下的数据到 Neo4j。
-    用法：
-        python neo4j_utils.py
-    """
-    data_dir = os.path.join(os.path.dirname(__file__), 'data/tyc_data')
-    print("开始导入数据到 Neo4j...")
-    neo4j_manager = Neo4jManager()
-    neo4j_manager.flush_db()
-    
-    importer = DataImporter(neo4j_manager, data_dir=data_dir)
-    importer.import_all()
-    print("数据导入完成！")
-    print("\n【如何在网页端查看数据】")
-    print("1. 启动 Neo4j Desktop 或 Neo4j 服务，确保数据库已运行。")
-    print("2. 在浏览器访问：http://localhost:7474/")
-    print("3. 默认用户名/密码 neo4j/neo4j（首次登录需修改密码）。")
-    print("4. 登录后可在 Cypher 控制台执行如 MATCH (n)-[r]->(m) RETURN n,r,m LIMIT 50; 查看图谱。")
+if __name__ =="""
 
+content = re.sub(r'class DataImporter:.*?if __name__ ==', new_data_importer, content, flags=re.DOTALL)
 
+with open(file_path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+print("Migration script completed!")
