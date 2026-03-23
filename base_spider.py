@@ -282,6 +282,27 @@ class base_spider:
         conn.commit()
         conn.close()
 
+    def remove_from_todo(self, src, id, entity_type=None):
+        '''
+        从todo表删除已完成的待爬取记录
+        '''
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+
+        if entity_type is None:
+            cursor.execute('''
+                DELETE FROM todo WHERE src=? AND id=?
+            ''', (src, id))
+        else:
+            cursor.execute('''
+                DELETE FROM todo WHERE src=? AND id=? AND entity_type=?
+            ''', (src, id, entity_type))
+
+        conn.commit()
+        deleted_rows = cursor.rowcount
+        conn.close()
+        return deleted_rows
+
     ## ** PART 4 : 相关统计函数 ** ##
     def __get_stats(self):
         '''

@@ -713,6 +713,7 @@ def _tyc_id_watcher(poll_interval=60):
                 gid_found, hid_found = result
                 watcher_spider.logger.info(f"本次爬取完成，发现 {len(gid_found)} 家企业股东，{len(hid_found)} 位自然人股东")
             watcher_spider.write_db(src="tyc", id=company_gid, entity_type="1")
+            watcher_spider.remove_from_todo(src="tyc", id=company_gid, entity_type="1")
         except Exception as e:
             watcher_spider.logger.info(f"本次爬取失败，错误原因: {e}")
             watcher_spider.close_session()

@@ -86,6 +86,14 @@ npm install
 python neo4j_utils.py
 ```
 
+脚本会在 `data/tyc_data/.import_state.json` 记录“上次最后导入时间”，下次默认只导入这个时间之后有修改的新文件。
+
+如果需要清空 Neo4j 并从头全量重导：
+
+```bash
+python neo4j_utils.py --reset
+```
+
 该脚本会自动读取 `data/tyc_data/` 下的数据文件并批量导入：
 
 | 文件类型 | 导入内容 |

@@ -1,3 +1,6 @@
+import argparse
+from datetime import datetime
+
 from py2neo import Graph, Node, Relationship
 import os
 import json
@@ -218,8 +221,79 @@ class DataImporter:
     def __init__(self, neo4j_manager, data_dir="data/tyc_data"):
         self.neo4j_manager = neo4j_manager
         self.data_dir = data_dir
+        self.state_file = os.path.join(self.data_dir, ".import_state.json")
         self.batch_size = 5000
         self.queue_maxsize = 1
+
+    def _format_timestamp(self, timestamp):
+        if timestamp is None:
+            return "未记录"
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _load_import_state(self):
+        if not os.path.exists(self.state_file):
+            return {}
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _get_last_import_time(self):
+        state = self._load_import_state()
+        timestamp = state.get("last_import_time")
+        if isinstance(timestamp, (int, float)):
+            return float(timestamp)
+        return None
+
+    def _save_import_state(self, timestamp):
+        state = {
+            "last_import_time": timestamp,
+            "last_import_time_readable": self._format_timestamp(timestamp),
+        }
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+
+    def reset_import_state(self):
+        if os.path.exists(self.state_file):
+            os.remove(self.state_file)
+
+    def _collect_files(self, prefix, last_import_time=None, limit=None):
+        files = []
+        for file_name in os.listdir(self.data_dir):
+            if not (file_name.startswith(prefix) and file_name.endswith(".json")):
+                continue
+            file_path = os.path.join(self.data_dir, file_name)
+            try:
+                modified_time = os.path.getmtime(file_path)
+            except OSError:
+                continue
+            if last_import_time is not None and modified_time <= last_import_time:
+                continue
+            files.append((file_name, modified_time))
+
+        files.sort(key=lambda item: (item[1], item[0]))
+        if limit is not None:
+            files = files[:limit]
+        return files
+
+    def _prepare_import_files(self, incremental=True):
+        last_import_time = self._get_last_import_time() if incremental else None
+        base_info_files = self._collect_files("base_info_", last_import_time=last_import_time)
+        investment_files = self._collect_files("investments_", last_import_time=last_import_time)
+        shareholder_files = self._collect_files("shareholders_", last_import_time=last_import_time)
+
+        selected_files = base_info_files + investment_files + shareholder_files
+        latest_import_time = max((modified_time for _, modified_time in selected_files), default=last_import_time)
+
+        return {
+            "last_import_time": last_import_time,
+            "base_info_files": [file_name for file_name, _ in base_info_files],
+            "investment_files": [file_name for file_name, _ in investment_files],
+            "shareholder_files": [file_name for file_name, _ in shareholder_files],
+            "latest_import_time": latest_import_time,
+        }
 
     def _iter_json_lines(self, file_path):
         with open(file_path, "r", encoding="utf-8") as f:
@@ -277,7 +351,7 @@ class DataImporter:
         q.put(None)
         q.join()
 
-    def import_all(self):
+    def import_all(self, incremental=True):
         '''
         分三步导入数据：
         1. 导入节点：先从 base_info 导入公司节点，再从 investments 和 shareholders 导入公司和自然人节点
@@ -287,11 +361,26 @@ class DataImporter:
         队列的工作方式：当主线程积累到 batch_size 条数据时放入队列，写线程从队列中取出数据并调用 Neo4jManager 的批量写入方法。
             这样可以让主线程在写线程处理当前批次时继续读取并积累下一批数据；如果写线程跟不上，主线程会在下一次 put 时阻塞，避免内存里堆积过多待写批次。
         '''
-        base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
-        investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
-        shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")][:1000]
+        import_plan = self._prepare_import_files(incremental=incremental)
+        base_info_files = import_plan["base_info_files"]
+        investment_files = import_plan["investment_files"]
+        shareholder_files = import_plan["shareholder_files"]
 
-        # --- 第一步：并发导5入公司和自然人节点 ---
+        total_files = len(base_info_files) + len(investment_files) + len(shareholder_files)
+        if incremental:
+            print(f"上次最后导入时间: {self._format_timestamp(import_plan['last_import_time'])}")
+        if total_files == 0:
+            print("没有新的文件需要导入。")
+            return False
+
+        print(
+            "本次待导入文件: "
+            f"base_info={len(base_info_files)}, "
+            f"investments={len(investment_files)}, "
+            f"shareholders={len(shareholder_files)}"
+        )
+
+        # --- 第一步：并发导入公司和自然人节点 ---
         q_co = queue.Queue(maxsize=self.queue_maxsize)
         q_per = queue.Queue(maxsize=self.queue_maxsize)
         
@@ -394,14 +483,33 @@ class DataImporter:
         self._flush_queue(q_sh, sh_batch)
         t_sh.join()
 
-    def import_all_one_by_one(self):
+        self._save_import_state(import_plan["latest_import_time"])
+        print(f"已更新最后导入时间: {self._format_timestamp(import_plan['latest_import_time'])}")
+        return True
+
+    def import_all_one_by_one(self, incremental=True):
         '''
         单线程逐条导入版本，用于和批量导入的速度做对比。
         导入顺序与 import_all 保持一致，只是不再使用队列和批量写入。
         '''
-        base_info_files = [f for f in os.listdir(self.data_dir) if f.startswith("base_info_") and f.endswith(".json")]
-        investment_files = [f for f in os.listdir(self.data_dir) if f.startswith("investments_") and f.endswith(".json")]
-        shareholder_files = [f for f in os.listdir(self.data_dir) if f.startswith("shareholders_") and f.endswith(".json")][:1000]
+        import_plan = self._prepare_import_files(incremental=incremental)
+        base_info_files = import_plan["base_info_files"]
+        investment_files = import_plan["investment_files"]
+        shareholder_files = import_plan["shareholder_files"]
+
+        total_files = len(base_info_files) + len(investment_files) + len(shareholder_files)
+        if incremental:
+            print(f"上次最后导入时间: {self._format_timestamp(import_plan['last_import_time'])}")
+        if total_files == 0:
+            print("没有新的文件需要导入。")
+            return False
+
+        print(
+            "本次待导入文件: "
+            f"base_info={len(base_info_files)}, "
+            f"investments={len(investment_files)}, "
+            f"shareholders={len(shareholder_files)}"
+        )
 
         # 1.1 从 base_info 导入公司
         for file in tqdm.tqdm(base_info_files, desc="逐条导入公司信息"):
@@ -452,22 +560,47 @@ class DataImporter:
                         percent=percent,
                     )
 
+        self._save_import_state(import_plan["latest_import_time"])
+        print(f"已更新最后导入时间: {self._format_timestamp(import_plan['latest_import_time'])}")
+        return True
+
 if __name__ == "__main__":
     """
     主函数：批量导入 data/tyc_data 下的数据到 Neo4j。
     用法：
         python neo4j_utils.py
     """
+    parser = argparse.ArgumentParser(description="导入 data/tyc_data 下的数据到 Neo4j")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="清空数据库并重置最后导入时间，然后全量重导",
+    )
+    parser.add_argument(
+        "--one-by-one",
+        action="store_true",
+        help="使用单线程逐条导入模式",
+    )
+    args = parser.parse_args()
+
     data_dir = os.path.join(os.path.dirname(__file__), 'data/tyc_data')
     print("开始导入数据到 Neo4j...")
     neo4j_manager = Neo4jManager()
-    neo4j_manager.flush_db()
     neo4j_manager.ensure_constraints()
     
     importer = DataImporter(neo4j_manager, data_dir=data_dir)
-    importer.import_all()
-    # importer.import_all_one_by_one()  # 逐条导入版本，测试用
-    print("数据导入完成！")
+    if args.reset:
+        print("检测到 --reset，先清空数据库并重置最后导入时间。")
+        neo4j_manager.flush_db()
+        importer.reset_import_state()
+
+    if args.one_by_one:
+        imported = importer.import_all_one_by_one(incremental=not args.reset)
+    else:
+        imported = importer.import_all(incremental=not args.reset)
+
+    if imported:
+        print("数据导入完成！")
     print("\n【如何在网页端查看数据】")
     print("1. 启动 Neo4j Desktop 或 Neo4j 服务，确保数据库已运行。")
     print("2. 在浏览器访问：http://localhost:7474/")
