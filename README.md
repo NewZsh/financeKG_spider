@@ -121,10 +121,10 @@ MATCH (p:Person) RETURN p LIMIT 20;
 MATCH (a:Company)-[r:INVEST]->(b:Company) RETURN a, r, b LIMIT 20;
 
 -- 查询某个公司的所有股东
-MATCH (s)-[r:SHAREHOLDER]->(c:Company {id: "公司ID"}) RETURN s, r, c;
+MATCH (c:Company {id: "公司ID"})-[r:SHAREHOLDER]->(s) RETURN c, r, s;
 
 -- 查询某个人/公司作为股东投资的所有公司
-MATCH (s {id: "股东ID"})-[r:SHAREHOLDER]->(c:Company) RETURN s, r, c;
+MATCH (c:Company)-[r:SHAREHOLDER]->(s {id: "股东ID"}) RETURN c, r, s;
 
 -- 查看全部图谱（限制 50 条）
 MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50;

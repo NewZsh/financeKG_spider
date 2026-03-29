@@ -4,6 +4,12 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR"
+FRONTEND_DIR="$PROJECT_ROOT/web_app/frontend"
+
+cd "$PROJECT_ROOT"
+
 echo "检查 Python 环境..."
 if ! command -v python >/dev/null 2>&1; then
   echo "未找到 python，请先安装或激活虚拟环境。" >&2
@@ -11,10 +17,12 @@ if ! command -v python >/dev/null 2>&1; then
 fi
 
 # 激活 venv if script在仓库根运行
-if [ -f ".venv/Scripts/activate" ]; then
-  source .venv/Scripts/activate
-elif [ -f "venv/bin/activate" ]; then
-  source venv/bin/activate
+if [ -f "$PROJECT_ROOT/.venv/Scripts/activate" ]; then
+  source "$PROJECT_ROOT/.venv/Scripts/activate"
+elif [ -f "$PROJECT_ROOT/.venv/bin/activate" ]; then
+  source "$PROJECT_ROOT/.venv/bin/activate"
+elif [ -f "$PROJECT_ROOT/venv/bin/activate" ]; then
+  source "$PROJECT_ROOT/venv/bin/activate"
 fi
 
 # 确认依赖
@@ -44,18 +52,18 @@ if ! nc -z localhost 7687; then
 fi
 
 # 启动后端和前端
-cd web_app/frontend
+cd "$FRONTEND_DIR"
 npm install
 
 # 使用简单的 & 将两个服务放到后台
 
 # 启动后端
-nohup uvicorn web_app.backend.main:app --reload --port 8000 &
+(cd "$PROJECT_ROOT" && nohup uvicorn web_app.backend.main:app --reload --port 8000) &
 backend_pid=$!
 echo "后端启动 pid=$backend_pid"
 
 # 启动前端
-(cd web_app/frontend && npm run dev) &
+(cd "$FRONTEND_DIR" && npm run dev) &
 frontend_pid=$!
 echo "前端启动 pid=$frontend_pid"
 

@@ -35,11 +35,11 @@ Neo4j 是否会重复导入，取决于你导入数据的方式和 Cypher 语句
     MATCH (a:Company)-[r:INVEST]->(b:Company) RETURN a, r, b LIMIT 20;
 
 查询某个公司及其所有股东（SHAREHOLDER）：
-    MATCH (s)-[r:SHAREHOLDER]->(c:Company {id: "公司ID"}) RETURN s, r, c;
+    MATCH (c:Company {id: "公司ID"})-[r:SHAREHOLDER]->(s) RETURN c, r, s;
 请将"公司ID"替换为实际的公司id。
 
 查询某个人或公司作为股东的所有公司：
-    MATCH (s {id: "股东ID"})-[r:SHAREHOLDER]->(c:Company) RETURN s, r, c;
+    MATCH (c:Company)-[r:SHAREHOLDER]->(s {id: "股东ID"}) RETURN c, r, s;
 请将"股东ID"替换为实际的id。
 
 查询某个公司的多层关系：
@@ -137,9 +137,9 @@ class Neo4jManager:
             shareholder = self.query_person_id(shareholder_id)
         if shareholder:
             rel = Relationship(
-                shareholder,
-                "SHAREHOLDER",
                 company,
+                "SHAREHOLDER",
+                shareholder,
                 percent=percent,
                 shareholder_name=shareholder.get("name"),
                 company_name=company.get("name"),
@@ -188,7 +188,7 @@ class Neo4jManager:
             UNWIND $batch AS row
             MATCH (p:Person {id: row.shareholder_id})
             MATCH (c:Company {id: row.company_id})
-            MERGE (p)-[r:SHAREHOLDER]->(c)
+            MERGE (c)-[r:SHAREHOLDER]->(p)
             SET r.percent = row.percent
             '''
             self.graph.run(q_person, batch=person_batch)
@@ -199,7 +199,7 @@ class Neo4jManager:
             UNWIND $batch AS row
             MATCH (s:Company {id: row.shareholder_id})
             MATCH (c:Company {id: row.company_id})
-            MERGE (s)-[r:SHAREHOLDER]->(c)
+            MERGE (c)-[r:SHAREHOLDER]->(s)
             SET r.percent = row.percent
             '''
             self.graph.run(q_company, batch=company_batch)
