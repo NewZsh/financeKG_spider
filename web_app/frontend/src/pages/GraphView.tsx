@@ -4,11 +4,141 @@ import axios from 'axios';
 import { useSearchParams } from 'react-router-dom';
 import styles from './GraphView.module.css';
 
-const API_BASE = 'http://localhost:8000'; // Make sure this matches FastAPI in dev mode. 
+type RawGraphNode = {
+  id: string;
+  label?: string;
+  type?: string;
+  properties?: Record<string, unknown>;
+};
+
+type RawGraphEdge = {
+  source: string;
+  target: string;
+  label?: string;
+  properties?: Record<string, unknown>;
+};
+
+type RawGraphData = {
+  nodes?: RawGraphNode[];
+  edges?: RawGraphEdge[];
+};
+
+type GraphNode = {
+  id: string;
+  data: Record<string, unknown>;
+  style: Record<string, unknown>;
+};
+
+type GraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  data: Record<string, unknown>;
+  style: Record<string, unknown>;
+};
+
+type GraphDataset = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
+const getNodePalette = (entityType?: string) => {
+  switch (entityType) {
+    case 'Company':
+      return { fill: '#C6E5FF', stroke: '#5B8FF9' };
+    case 'Person':
+      return { fill: '#FCE8C3', stroke: '#D9902F' };
+    default:
+      return { fill: '#E8EEF5', stroke: '#718096' };
+  }
+};
+
+const buildEdgeId = (edge: RawGraphEdge) => {
+  const relation = edge.label || 'RELATION';
+  const percent = String(edge.properties?.percent || '');
+  return `${String(edge.source)}-${relation}-${String(edge.target)}-${percent}`;
+};
+
+const normalizeGraphData = (rawData: RawGraphData | null): GraphDataset => {
+  const rawNodes = rawData?.nodes || [];
+  const rawEdges = rawData?.edges || [];
+
+  return {
+    nodes: rawNodes.map((node) => {
+      const id = String(node.id);
+      const label = String(node.label || node.properties?.name || id);
+      const entityType = String(node.type || 'Unknown');
+      const palette = getNodePalette(entityType);
+
+      return {
+        id,
+        data: {
+          ...(node.properties || {}),
+          entityType,
+          displayLabel: label,
+        },
+        style: {
+          size: 48,
+          fill: palette.fill,
+          stroke: palette.stroke,
+          lineWidth: 2,
+          label: true,
+          labelText: label,
+          labelPlacement: 'bottom',
+          labelFill: '#1F2D3D',
+          labelFontSize: 12,
+          labelMaxWidth: 180,
+          labelWordWrap: true,
+          labelOffsetY: 10,
+          cursor: 'pointer',
+        },
+      };
+    }),
+    edges: rawEdges.map((edge) => {
+      const percent = String(edge.properties?.percent || '').trim();
+      const relationLabel = String(edge.label || 'RELATION');
+      const edgeLabel = percent && percent !== '-' ? `${relationLabel} ${percent}` : relationLabel;
+
+      return {
+        id: buildEdgeId(edge),
+        source: String(edge.source),
+        target: String(edge.target),
+        data: {
+          ...(edge.properties || {}),
+          relationLabel,
+        },
+        style: {
+          stroke: '#AAB7C4',
+          lineWidth: 1.3,
+          endArrow: true,
+          label: true,
+          labelText: edgeLabel,
+          labelFontSize: 10,
+          labelFill: '#5D6B7A',
+          labelBackground: true,
+          labelBackgroundFill: 'rgba(255, 255, 255, 0.88)',
+          labelPadding: [2, 4, 2, 4],
+        },
+      };
+    }),
+  };
+};
+
+const getEventNodeId = (event: any) => {
+  const candidate =
+    event?.target?.id ||
+    event?.target?.config?.id ||
+    event?.target?.__data__?.id ||
+    event?.itemId ||
+    event?.id ||
+    event?.data?.id;
+
+  return candidate ? String(candidate) : '';
+};
 
 const GraphView = () => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const graphRef = useRef<any>(null);
+  const graphRef = useRef<Graph | null>(null);
   const [searchParams] = useSearchParams();
   const companyId = searchParams.get('id');
   const queryType = searchParams.get('queryType');
@@ -17,6 +147,7 @@ const GraphView = () => {
   const [subtitle, setSubtitle] = useState('');
   const [message, setMessage] = useState('正在加载图谱...');
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error'>('loading');
+  const [graphData, setGraphData] = useState<GraphDataset | null>(null);
 
   const statusLabel = status === 'loading'
     ? '加载中'
@@ -35,75 +166,18 @@ const GraphView = () => {
         : `${styles.badge} ${styles.badgeError}`;
 
   useEffect(() => {
-    let graph: any = null;
     let cancelled = false;
-
-    const mountGraph = (graphData: any) => {
-      if (!containerRef.current) {
-        return;
-      }
-
-      const width = containerRef.current.clientWidth;
-      const height = 600;
-
-      graph = new Graph({
-        container: containerRef.current,
-        width,
-        height,
-        layout: {
-          type: 'force',
-          preventOverlap: true,
-          linkDistance: 150,
-          nodeSize: 50,
-        },
-        modes: {
-          default: ['drag-canvas', 'zoom-canvas', 'drag-node'],
-        },
-        defaultNode: {
-          size: 50,
-          style: { fill: '#C6E5FF', stroke: '#5B8FF9', lineWidth: 2 },
-          labelCfg: { position: 'bottom', offset: 5 },
-        },
-        defaultEdge: {
-          style: { stroke: '#e2e2e2', lineWidth: 1, endArrow: true },
-          labelCfg: { autoRotate: true },
-        },
-      });
-
-      graphRef.current = graph;
-      graph.setData(graphData);
-      graph.render();
-
-      graph.on('node:dblclick', (e: any) => {
-        const clickedNodeId = e.target?.id || e.itemId || e.id;
-        if (!clickedNodeId) return;
-
-        axios.get(`${API_BASE}/api/graph/company/${clickedNodeId}/graph?hops=2`)
-          .then(({ data }) => {
-            const currentData = graphRef.current.getData();
-
-            const newNodes = data.nodes.filter((n: any) => !currentData.nodes?.find((cn: any) => cn.id === n.id));
-            const newEdges = data.edges.filter((edge: any) => !currentData.edges?.find((currentEdge: any) => currentEdge.source === edge.source && currentEdge.target === edge.target && currentEdge.label === edge.label));
-
-            graphRef.current.addData({
-              nodes: newNodes,
-              edges: newEdges,
-            });
-            graphRef.current.render();
-          })
-          .catch(err => console.error('Error expanding node:', err));
-      });
-    };
 
     const fetchGraph = async () => {
       setStatus('loading');
       setMessage('正在加载图谱...');
+      setGraphData(null);
 
       try {
         if (companyId) {
           setTitle('公司关系图谱');
           setSubtitle(`公司 ID: ${companyId}`);
-          const { data } = await axios.get(`${API_BASE}/api/graph/company/${companyId}/graph`);
+          const { data } = await axios.get(`/api/graph/company/${companyId}/graph`);
           if (cancelled) return;
 
           if (!data.nodes?.length) {
@@ -112,14 +186,14 @@ const GraphView = () => {
             return;
           }
 
+          setGraphData(normalizeGraphData(data));
           setStatus('ready');
           setMessage('');
-          mountGraph(data);
           return;
         }
 
         if (queryType && keyword) {
-          const { data } = await axios.get(`${API_BASE}/api/graph/stock/graph`, {
+          const { data } = await axios.get(`/api/graph/stock/graph`, {
             params: { query_type: queryType, keyword },
           });
           if (cancelled) return;
@@ -137,9 +211,9 @@ const GraphView = () => {
             return;
           }
 
+          setGraphData(normalizeGraphData(data.graph));
           setStatus('ready');
           setMessage('');
-          mountGraph(data.graph);
           return;
         }
 
@@ -157,11 +231,123 @@ const GraphView = () => {
 
     return () => {
       cancelled = true;
-      if (graph) {
-        graph.destroy();
-      }
     };
   }, [companyId, keyword, queryType]);
+
+  useEffect(() => {
+    if (status !== 'ready' || !graphData || !containerRef.current) {
+      return;
+    }
+
+    const container = containerRef.current;
+    const height = 600;
+    const width = container.clientWidth || container.offsetWidth || 800;
+    const graph = new Graph({
+      container,
+      data: graphData,
+      width,
+      height,
+      autoFit: 'view',
+      padding: 32,
+      zoomRange: [0.2, 4],
+      layout: {
+        type: 'force',
+        preventOverlap: true,
+        linkDistance: 150,
+        nodeSize: 48,
+      },
+      behaviors: ['drag-canvas', 'zoom-canvas', 'drag-element'],
+      node: {
+        type: 'circle',
+        style: {
+          size: 48,
+          fill: '#C6E5FF',
+          stroke: '#5B8FF9',
+          lineWidth: 2,
+          label: true,
+          labelPlacement: 'bottom',
+          labelFill: '#1F2D3D',
+          labelFontSize: 12,
+          labelMaxWidth: 180,
+          labelWordWrap: true,
+          labelOffsetY: 10,
+        },
+      },
+      edge: {
+        type: 'line',
+        style: {
+          stroke: '#AAB7C4',
+          lineWidth: 1.3,
+          endArrow: true,
+          label: true,
+          labelFontSize: 10,
+          labelFill: '#5D6B7A',
+          labelBackground: true,
+          labelBackgroundFill: 'rgba(255, 255, 255, 0.88)',
+          labelPadding: [2, 4, 2, 4],
+          labelAutoRotate: true,
+        },
+      },
+    });
+
+    graphRef.current = graph;
+    void graph.render().catch((err) => {
+      console.error('Error rendering graph:', err);
+      if (graphRef.current === graph) {
+        graphRef.current = null;
+      }
+      setStatus('error');
+      setMessage('图谱渲染失败');
+      graph.destroy();
+    });
+
+    graph.on('node:dblclick', (e: any) => {
+      const clickedNodeId = getEventNodeId(e);
+      if (!clickedNodeId || !graphRef.current) {
+        return;
+      }
+
+      axios.get(`/api/graph/company/${clickedNodeId}/graph?hops=2`)
+        .then(({ data }) => {
+          if (!graphRef.current) {
+            return;
+          }
+
+          const nextData = normalizeGraphData(data);
+          const currentData = graphRef.current.getData();
+          const newNodes = nextData.nodes.filter((node) => !currentData.nodes?.find((currentNode: any) => currentNode.id === node.id));
+          const newEdges = nextData.edges.filter((edge) => !currentData.edges?.find((currentEdge: any) => currentEdge.id === edge.id));
+
+          graphRef.current.addData({
+            nodes: newNodes,
+            edges: newEdges,
+          });
+          void graphRef.current.render();
+        })
+        .catch(err => console.error('Error expanding node:', err));
+    });
+
+    const handleResize = () => {
+      if (!containerRef.current || !graphRef.current) {
+        return;
+      }
+
+      const nextWidth = containerRef.current.clientWidth || containerRef.current.offsetWidth;
+      if (nextWidth > 0 && graphRef.current.setSize) {
+        graphRef.current.setSize(nextWidth, height);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (graphRef.current === graph) {
+        graphRef.current = null;
+      }
+      graph.destroy();
+    };
+  }, [graphData, status]);
 
   const renderHeader = () => (
     <div className={styles.header}>

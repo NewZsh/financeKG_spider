@@ -3,8 +3,6 @@ import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import styles from './Home.module.css';
 
-const API_BASE = 'http://localhost:8000';
-
 type QueryType = 'code' | 'name';
 
 type ExampleCompany = {
@@ -53,7 +51,7 @@ export default function Home() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    axios.get(`${API_BASE}/api/graph/examples`)
+    axios.get('/api/graph/examples')
       .then(res => setExamples(res.data.examples))
       .catch(err => console.error(err));
   }, []);

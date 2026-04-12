@@ -131,6 +131,8 @@ def get_stock_graph(
         stock_info = stock_directory_service.lookup(query_type=query_type, keyword=keyword)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"股票目录服务不可用: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取股票列表失败: {exc}") from exc
 

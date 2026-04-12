@@ -1,9 +1,18 @@
+"""股票目录服务。
+
+负责从 akshare 拉取沪深北股票基础信息，构建代码和名称索引，
+并提供带缓存的股票查询能力。
+"""
+
 import threading
 import time
 import unicodedata
 from typing import Dict, List, Optional
 
-import akshare as ak
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 
 
 def normalize_company_name(value: Optional[str]) -> str:
@@ -43,6 +52,9 @@ class StockDirectoryService:
                 bucket.append(record)
 
     def _reload_directory(self):
+        if ak is None:
+            raise RuntimeError("akshare is not installed")
+
         records: List[Dict[str, Optional[str]]] = []
 
         sh_df = ak.stock_info_sh_name_code()
@@ -103,6 +115,9 @@ class StockDirectoryService:
 
     def _enrich_full_name(self, record: Dict[str, Optional[str]]):
         if record.get("full_name"):
+            return record
+
+        if ak is None:
             return record
 
         with self._lock:
