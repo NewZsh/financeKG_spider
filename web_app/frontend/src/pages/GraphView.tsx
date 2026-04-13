@@ -193,7 +193,7 @@ const GraphView = () => {
         }
 
         if (queryType && keyword) {
-          const { data } = await axios.get(`/api/graph/stock/graph`, {
+          const { data } = await axios.get(`/api/stock/graph`, {
             params: { query_type: queryType, keyword },
           });
           if (cancelled) return;

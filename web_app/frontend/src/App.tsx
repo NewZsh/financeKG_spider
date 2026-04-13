@@ -5,6 +5,7 @@ import TYCKeywords from './pages/TYCKeywords';
 import TYcStats from './pages/TYCStats';
 import Config from './pages/Config';
 import GraphView from './pages/GraphView';
+import StockGraphView from './pages/StockGraphView';
 
 export default function App(){
   return (
@@ -16,6 +17,7 @@ export default function App(){
           <Route path='/tyc/keywords' element={<TYCKeywords/>} />
           <Route path='/tyc/stats' element={<TYcStats/>} />
           <Route path='/graph' element={<GraphView/>} />
+          <Route path='/stock-graph' element={<StockGraphView/>} />
         </Routes>
       </div>
     </BrowserRouter>

@@ -48,6 +48,7 @@ export default function Home() {
   const [queryType, setQueryType] = useState<QueryType>('code');
   const [examples, setExamples] = useState<ExampleCompany[]>([]);
   const [errorMessage, setErrorMessage] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -56,7 +57,7 @@ export default function Home() {
       .catch(err => console.error(err));
   }, []);
 
-  const handleSearch = () => {
+  const handleSearch = async () => {
     const trimmedKeyword = keyword.trim();
     if (!trimmedKeyword) {
       setErrorMessage(queryType === 'code' ? '请输入 6 位股票代码' : '请输入公司名称');
@@ -69,7 +70,25 @@ export default function Home() {
     }
 
     setErrorMessage('');
-    navigate(`/graph?queryType=${queryType}&keyword=${encodeURIComponent(trimmedKeyword)}`);
+    setIsSearching(true);
+
+    try {
+      const { data } = await axios.get('/api/stock/lookup', {
+        params: { query_type: queryType, keyword: trimmedKeyword },
+      });
+
+      if (data.matched) {
+        navigate(`/stock-graph?queryType=${queryType}&keyword=${encodeURIComponent(trimmedKeyword)}`);
+        return;
+      }
+
+      navigate(`/graph?queryType=${queryType}&keyword=${encodeURIComponent(trimmedKeyword)}`);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      setErrorMessage(typeof detail === 'string' ? detail : '查询失败，请稍后重试');
+    } finally {
+      setIsSearching(false);
+    }
   };
 
   const handleQueryTypeChange = (value: QueryType) => {
@@ -102,7 +121,7 @@ export default function Home() {
     <div className={styles.searchPanel}>
       <div className={styles.sectionHeader}>
         <h2 className={styles.sectionTitle}>知识图谱查询</h2>
-        <p className={styles.sectionDesc}>支持沪深北 A 股精确匹配。命中上市公司后会自动跳转到二跳图谱；如果数据库中还没有该公司数据，会在图谱页直接提示。</p>
+        <p className={styles.sectionDesc}>支持沪深北 A 股精确匹配。命中上市公司时会进入增强详情页，展示图谱、K 线、5 日量价与交易分布；未命中上市目录时仍保持原有图谱页。</p>
       </div>
       <div className={styles.segmented}>
         <button
@@ -126,12 +145,14 @@ export default function Home() {
           onChange={(e) => handleKeywordChange(e.target.value)}
           placeholder={queryType === 'code' ? '输入 6 位股票代码，例如 000001' : '输入公司名称，例如 平安银行'}
           className={styles.searchInput}
-          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+          onKeyDown={(e) => e.key === 'Enter' && !isSearching && void handleSearch()}
         />
-        <button type="button" onClick={handleSearch} className={styles.searchButton}>打开图谱</button>
+        <button type="button" onClick={() => void handleSearch()} className={styles.searchButton} disabled={isSearching}>
+          {isSearching ? '识别中...' : '打开图谱'}
+        </button>
       </div>
       <div className={styles.helperText}>
-        {queryType === 'code' ? '代码查询要求 6 位数字，例如 000001、600000、920000。' : '公司名查询为精确匹配，会优先匹配上市公司名称。'}
+        {queryType === 'code' ? '代码查询要求 6 位数字，例如 000001、600000、920000。' : '公司名查询为精确匹配，会优先匹配上市公司名称并决定跳转页面。'}
       </div>
       {errorMessage && <div className={styles.errorText}>{errorMessage}</div>}
       <div className={styles.examplesBlock}>

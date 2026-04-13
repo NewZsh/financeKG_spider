@@ -211,6 +211,11 @@
   cursor: pointer;
 }
 
+.searchButton:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
 .helperText {
   margin-bottom: 10px;
   color: #6d7685;
