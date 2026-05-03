@@ -4,7 +4,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
 from neo4j_utils import Neo4jManager
-from .stock_directory import normalize_company_name
+from stock.directory import normalize_company_name
 
 neo4j_mgr = Neo4jManager()
 

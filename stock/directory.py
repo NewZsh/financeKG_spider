@@ -1,8 +1,10 @@
-"""股票目录服务。
+"""股票基础目录。
 
 负责从 akshare 拉取沪深北股票基础信息，构建代码和名称索引，
 并提供带缓存的股票查询能力。
 """
+
+from __future__ import annotations
 
 import threading
 import time
