@@ -6,13 +6,12 @@ review_*: 每日复盘同步、计算和输出
 """
 
 from .directory import StockDirectoryService, ak, normalize_company_name, stock_directory_service
-from .sync_market_data import build_stock_market_payload, empty_market_payload
+from .sync_market_data import StockMarketDataReader
 
 __all__ = [
     "StockDirectoryService",
     "ak",
     "normalize_company_name",
     "stock_directory_service",
-    "build_stock_market_payload",
-    "empty_market_payload",
+    "StockMarketDataReader",
 ]

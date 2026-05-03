@@ -1,6 +1,6 @@
 from .graph_service import find_company_by_stock, get_company_graph
 from stock.directory import stock_directory_service
-from financeKG_spider.stock.sync_market_data import build_stock_market_payload, empty_market_payload
+from financeKG_spider.stock.sync_market_data import StockMarketDataReader
 
 
 def lookup_stock_info(query_type: str, keyword: str):
@@ -65,11 +65,11 @@ def get_stock_detail_payload(query_type: str, keyword: str):
             "company": None,
             "has_data": False,
             "graph": {"nodes": [], "edges": []},
-            "market": empty_market_payload(),
+            "market": StockMarketDataReader.get_empty_payload(),
         }
 
     graph_payload = build_stock_graph_payload(stock_info)
-    market_payload = build_stock_market_payload(stock_info)
+    market_payload = StockMarketDataReader.build_stock_market_payload(stock_info)
     return {
         **graph_payload,
         "market": market_payload,
