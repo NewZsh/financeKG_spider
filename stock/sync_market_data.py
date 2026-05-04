@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import mplfinance as mpf
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -699,6 +700,31 @@ class StockMarketDataReader:
         rows = conn.execute("SELECT trade_date, summary_json, buy_sell_bins_json, price_histogram_json FROM daily_price_distributions WHERE code = ? ORDER BY trade_date DESC LIMIT ?", (code, lookback_days)).fetchall()
         return [{"date": str(r["trade_date"]), "summary": json.loads(r["summary_json"]), "buy_sell_bins": json.loads(r["buy_sell_bins_json"]), "price_histogram": json.loads(r["price_histogram_json"])} for r in reversed(rows)]
 
+    @staticmethod
+    def plot_kline(code: str, limit: int = 120) -> None:
+        """展示给定股票的前复权 K 线图及移动平均线（MA5, MA10, MA20）"""
+        conn = DbManager.get_connection()
+        try:
+            query = "SELECT trade_date, open, high, low, close, volume FROM daily_bars WHERE code = ? AND adjust_type = 'qfq' ORDER BY trade_date DESC LIMIT ?"
+            df = pd.read_sql(query, conn, params=(code, limit))
+        finally:
+            conn.close()
+
+        if df.empty:
+            print(f"数据不足: 数据库中没有找到 {code} 的前复权数据")
+            return
+
+        df = df.sort_values("trade_date")
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df.set_index("trade_date", inplace=True)
+        # mplfinance 要求列名为大写首字母
+        df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+
+        mpf.plot(df, type='candle', mav=(5, 10, 20), volume=True,
+                 title=f"Stock K-Line: {code}",
+                 style='yahoo',
+                 show_nontrading=False)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="同步 A 股行情到 SQLite")
@@ -706,7 +732,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=["incremental", "full"], default="incremental", help="incremental 仅拉当日，full 全量刷新到当日")
     parser.add_argument("--limit", type=int, default=0, help="仅同步前 N 只股票，便于调试")
     parser.add_argument("--force-full-adjust", action="store_true", help="强制所有股票重刷前复权历史")
+    parser.add_argument("--plot", type=str, default=None, help="输入股票代码（如 000001），直接拉取库中数据并展示K线图（不会进行同步操作）")
     args = parser.parse_args()
+
+    if args.plot:
+        StockMarketDataReader.plot_kline(args.plot, limit=120)
+        return
 
     engine = StockMarketSyncEngine(
         mode=args.mode,
