@@ -1042,3 +1042,6 @@ def main_daily_review() -> None:
         skip_sync=args.skip_sync,
         recent_days=args.recent_days,
     )
+
+if __name__ == "__main__":
+    main_daily_review()
