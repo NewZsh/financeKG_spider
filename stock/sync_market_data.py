@@ -38,7 +38,7 @@ import pandas as pd
 import requests
 
 MARKET_CACHE_TTL_SECONDS = 10 * 60
-FULL_REFRESH_START = "20100101"
+FULL_REFRESH_START = "20200101"
 TENCENT_BATCH_SIZE = 50
 INTRADAY_LOOKBACK_DAYS = 5
 INTRADAY_FETCH_WINDOW_DAYS = 14
@@ -47,6 +47,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 SCHEMA_PATH = DATA_DIR / "schema" / "stock.sql"
 DB_PATH = DATA_DIR / "stock.db"
+PROGRESS_PATH = DATA_DIR / "sync_progress.json"
 
 BOARD_CATEGORIES = {
     "主板-沪（60）": lambda code: code.startswith("60"),
@@ -318,6 +319,17 @@ class StockMarketSyncEngine:
             "spot_enriched_codes": 0, "full_refresh_codes": [], "adjustment_event_updates": 0, "errors": []
         }
 
+    def _get_progress_data(self) -> dict:
+        if PROGRESS_PATH.exists():
+            try:
+                return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_progress_data(self, data: dict):
+        PROGRESS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def run_sync(self, review_date: Optional[str] = None) -> dict:
         """主同步逻辑"""
         trade_date, compact_date = Utils.parse_sync_date(review_date)
@@ -342,15 +354,28 @@ class StockMarketSyncEngine:
         tencent_spot = MarketDataFetcher.fetch_tencent_realtime(sync_df["code"].tolist())
 
         total_tasks = len(sync_df)
-        completed_tasks = 0
+        
+        task_key = f"{trade_date}_{self.mode}_{self.force_full_adjust}"
+        progress_data = self._get_progress_data()
+        
+        if progress_data.get("task_key") != task_key:
+            progress_data = {"task_key": task_key, "completed_codes": []}
+            self._save_progress_data(progress_data)
+            
+        completed_codes = set(progress_data["completed_codes"])
+        completed_tasks = len(completed_codes)
 
         # 清除针对这批股票的缓存
         for _, row in sync_df.iterrows():
             StockMarketDataReader.clear_cache(str(row["code"]))
 
         for row in sync_df.itertuples(index=False):
+            code_str = str(row.code)
+            if code_str in completed_codes:
+                continue
+                
             self._process_single_stock(
-                conn=conn, code=str(row.code), trade_date=trade_date, daily_start_date=daily_start_date, end_date=end_date,
+                conn=conn, code=code_str, trade_date=trade_date, daily_start_date=daily_start_date, end_date=end_date,
                 intra_start=intra_start, intra_end=intra_end,
                 tencent_spot=tencent_spot,
                 is_full=is_full
@@ -358,6 +383,12 @@ class StockMarketSyncEngine:
             completed_tasks += 1
             sys.stdout.write(f"\r同步进度: [{completed_tasks}/{total_tasks}] {completed_tasks/total_tasks*100:.1f}%")
             sys.stdout.flush()
+            
+            # 使用锁保存进度，防止多线程时冲突导致文件损坏（如果是单线程此时无锁也安全）
+            with self.summary_lock:
+                completed_codes.add(code_str)
+                progress_data["completed_codes"] = list(completed_codes)
+                self._save_progress_data(progress_data)
         
         sys.stdout.write("\n")
         conn.close()
