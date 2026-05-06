@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""股票每日复盘主入口，用于计算技术指标、打分排序并生成复盘推荐报告。
+
+参数：
+    --date: 复盘日期，格式 YYYYMMDD 或 YYYY-MM-DD，默认为最新交易日
+    --top: Markdown 中展示的 TOP N，默认为 10
+    --limit: 仅分析前 N 只候选股（用于调试），默认为 0（不限制）
+    --all-boards: 包含创业板、科创板等全部板块，默认为只看主板
+    --skip-sync: 跳过当日同步完整性检查，直接使用 SQLite 现有数据
+    --force-run: 忽略启动时间和当日运行记录，强制执行复盘
+
+用法：
+    - 对指定日期进行增量数据检查并分析打分，生成复盘报告：
+        python -m stock.review_common --date 2026-04-30
+        
+    - 数据已单独拉取完毕，直接使用数据库数据生成 2026-04-30 的全市场（含科创/创业板）推荐池，并且报告展示前 20 只：
+        python -m stock.review_common --date 2026-04-30 --top 20 --skip-sync --all-boards
+
+    - 自动触发启动检查（根据时间判断是否需要更新）：
+        python -m stock.review_common
+"""
 
 from __future__ import annotations
 
@@ -867,7 +887,7 @@ def write_review_markdown(
                     f"{item['vol_ratio']:.1f}x",
                     f"{item['rsi']:.1f}",
                     f"{item['bias']:.2f}%",
-                    f"{item.get('float_mv_yi', 0):.1f}",
+                    f"{item.get('float_mv_yi') or 0:.1f}",
                 ]
             )
         writer.append(markdown_table(rows, ["代码", "名称", "现价", "今开", "最高", "最低", "涨跌", "评分", "量比", "RSI", "乖离", "流通市值亿"]))

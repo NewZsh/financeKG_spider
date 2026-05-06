@@ -10,7 +10,7 @@ import sqlite3
 import pandas as pd
 
 try:
-    from compute_indicators import LOOKBACK_DAYS, analyze_stock
+    from compute_indicators import LOOKBACK_DAYS, analyze_stock, calc_rsi
     from review_common import (
         ALLOWED_BOARDS,
         MAX_FLOAT_MV,
@@ -22,7 +22,7 @@ try:
         to_csv_rows,
     )
 except ImportError:
-    from .compute_indicators import LOOKBACK_DAYS, analyze_stock
+    from .compute_indicators import LOOKBACK_DAYS, analyze_stock, calc_rsi
     from .review_common import (
         ALLOWED_BOARDS,
         MAX_FLOAT_MV,
@@ -37,11 +37,80 @@ except ImportError:
 
 BACKTEST_DIR = REVIEW_DIR / "backtests"
 STOP_LOSS_RATIO = 0.10
-TRAILING_PROFIT_GIVEBACK = 0.30
+TRAILING_PROFIT_ACTIVATION = 0.10
+TRAILING_PROFIT_DRAWDOWN = 0.30
 TAKE_PROFIT_COOLDOWN_DAYS = 30
 DEFAULT_INITIAL_CAPITAL = 100000.0
 DEFAULT_POSITION_SIZE = 10000.0
 DEFAULT_MAX_POSITIONS = 10
+
+
+class MarketDataCache:
+    def __init__(self, conn: sqlite3.Connection, start_trade_date: str | None, end_trade_date: str | None):
+        self.stock_info = {}
+        print("=> Preloading stock metadata into memory...", flush=True)
+        for row in conn.execute("SELECT s.code, s.name, s.board, s.is_st, lmv.float_mv_yi FROM stocks s LEFT JOIN latest_market_value lmv ON s.code = lmv.code").fetchall():
+            self.stock_info[str(row["code"])] = {
+                "name": row["name"],
+                "board": row["board"],
+                "is_st": row["is_st"],
+                "float_mv_yi": row["float_mv_yi"]
+            }
+        
+        params = []
+        date_cond = ""
+        if start_trade_date:
+            start_dt = pd.Timestamp(start_trade_date) - pd.Timedelta(days=250)
+            date_cond = "AND trade_date >= ?"
+            params.append(start_dt.strftime("%Y-%m-%d"))
+        if end_trade_date:
+            date_cond += " AND trade_date <= ?"
+            params.append(end_trade_date)
+            
+        # NOTE: volume from daily_bars is not strictly required by compute_indicators (only amount),
+        # but loaded for API completeness
+        query = f"SELECT code, trade_date as date, open, high, low, close, volume, amount FROM daily_bars WHERE adjust_type = 'qfq' {date_cond} ORDER BY code, trade_date"
+        
+        print(f"=> Preloading daily bars [{start_trade_date or 'ALL'} ~ {end_trade_date or 'ALL'}]...", flush=True)
+        df = pd.read_sql_query(query, conn, params=params)
+        
+        print("=> Calculating global sequence indicators (MA5, MA10, MA20, MA60, RSI) via Pandas batch...", flush=True)
+        df["ma5"] = df.groupby("code")["close"].transform(lambda x: x.rolling(5).mean())
+        df["ma10"] = df.groupby("code")["close"].transform(lambda x: x.rolling(10).mean())
+        df["ma20"] = df.groupby("code")["close"].transform(lambda x: x.rolling(20).mean())
+        df["ma60"] = df.groupby("code")["close"].transform(lambda x: x.rolling(60).mean())
+        df["rsi"] = df.groupby("code")["close"].transform(calc_rsi)
+
+        print("=> Indexing memory slices...", flush=True)
+        self.code_dfs = {code: group.reset_index(drop=True) for code, group in df.groupby("code")}
+        
+        all_dates = list(df['date'].unique())
+        all_dates.sort()
+        self.review_dates = []
+        for d in all_dates:
+            if start_trade_date and d < start_trade_date:
+                continue
+            if end_trade_date and d > end_trade_date:
+                continue
+            self.review_dates.append(str(d))
+            
+    def get_future_bars(self, code: str, review_date: str) -> list[dict]:
+        df = self.code_dfs.get(code)
+        if df is None: return []
+        idx = df["date"].searchsorted(review_date, side="right")
+        future_df = df.iloc[idx:].copy()
+        future_df["trade_date"] = future_df["date"]
+        return future_df[["trade_date", "open", "high", "low", "close", "ma20"]].to_dict('records')
+
+    def get_close_lookup(self, codes: set[str], start_date: str, end_date: str) -> dict[tuple[str, str], float]:
+        lookup = {}
+        for code in codes:
+            df = self.code_dfs.get(code)
+            if df is None: continue
+            subset = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
+            for _, row in subset.iterrows():
+                lookup[(code, str(row["date"]))] = float(row["close"])
+        return lookup
 
 
 def load_backtest_dates(conn: sqlite3.Connection, start_date: str | None, end_date: str | None) -> list[str]:
@@ -65,13 +134,71 @@ def load_backtest_dates(conn: sqlite3.Connection, start_date: str | None, end_da
     return [str(row[0]) for row in rows]
 
 
+def build_daily_signals_cached(
+    cache: MarketDataCache,
+    review_date: str,
+    top_n: int,
+    limit: int,
+    include_all_boards: bool,
+    scoring_mode: str,
+    is_backtest: bool = False,
+) -> list[dict]:
+    candidates = []
+    count = 0
+    for code, df in cache.code_dfs.items():
+        if limit > 0 and count >= limit:
+            break
+            
+        info = cache.stock_info.get(code)
+        if not info:
+            continue
+            
+        if not is_backtest and info["is_st"]:
+            continue
+            
+        if not include_all_boards and info["board"] not in ALLOWED_BOARDS:
+            continue
+
+        idx = df["date"].searchsorted(review_date, side="right")
+        if idx < LOOKBACK_DAYS // 2:
+            continue
+            
+        current_bar = df.iloc[idx - 1]
+        if current_bar["date"] != review_date:
+            continue
+            
+        amount_wan = current_bar["amount"] / 10000.0
+        if amount_wan < MIN_DAILY_AMOUNT:
+            continue
+            
+        float_mv = info["float_mv_yi"]
+        if not is_backtest:
+            if float_mv is not None and not (MIN_FLOAT_MV <= float_mv <= MAX_FLOAT_MV):
+                continue
+            
+        kline = df.iloc[max(0, idx - LOOKBACK_DAYS - 80):idx]
+        result = analyze_stock(code, info["name"], kline, scoring_mode=scoring_mode)
+        if result:
+            result["board"] = info["board"]
+            result["open"] = round(float(current_bar["open"]), 2)
+            result["high"] = round(float(current_bar["high"]), 2)
+            result["low"] = round(float(current_bar["low"]), 2)
+            result["float_mv_yi"] = round(float(float_mv), 2) if float_mv is not None else None
+            result["amount_wan"] = round(float(amount_wan), 2)
+            candidates.append(result)
+        count += 1
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:top_n]
+
+
 def load_backtest_candidates(
     conn: sqlite3.Connection,
     review_date: str,
     include_all_boards: bool,
 ) -> list[sqlite3.Row]:
     board_condition = ""
-    params: list[object] = [review_date, review_date, review_date]
+    params: list[object] = [review_date, review_date]
     if not include_all_boards:
         placeholders = ",".join("?" for _ in ALLOWED_BOARDS)
         board_condition = f"AND s.board IN ({placeholders})"
@@ -109,13 +236,14 @@ def load_backtest_candidates(
                 ELSE NULL
             END AS pct_change,
             ldb.amount / 10000.0 AS amount_wan,
-            ldb.float_mv_yi
+            lmv.float_mv_yi
         FROM stocks s
         INNER JOIN latest_day_bars ldb ON ldb.code = s.code
+        LEFT JOIN latest_market_value lmv ON lmv.code = s.code
         WHERE s.is_st = 0
           {board_condition}
           AND ldb.amount / 10000.0 >= ?
-          AND (ldb.float_mv_yi IS NULL OR ldb.float_mv_yi BETWEEN ? AND ?)
+          AND (lmv.float_mv_yi IS NULL OR lmv.float_mv_yi BETWEEN ? AND ?)
         ORDER BY s.code
     """
     params.extend([MIN_DAILY_AMOUNT, MIN_FLOAT_MV, MAX_FLOAT_MV])
@@ -198,6 +326,7 @@ def simulate_trade_from_bars(
         trade_date = str(bar["trade_date"])
         low_price = float(bar["low"])
         close_price = float(bar["close"])
+        ma20_price = float(bar["ma20"]) if "ma20" in dict(bar) and not pd.isna(bar["ma20"]) else 0.0
 
         if low_price <= stop_loss_price:
             return {
@@ -212,17 +341,18 @@ def simulate_trade_from_bars(
 
         historical_max_profit = max_profit
         current_close_profit = close_price / entry_price - 1
-        if historical_max_profit > 0 and current_close_profit < historical_max_profit:
-            if current_close_profit <= historical_max_profit * TRAILING_PROFIT_GIVEBACK:
-                return {
-                    "entry_date": entry_date,
-                    "exit_date": trade_date,
-                    "exit_price": round(close_price, 4),
-                    "return_pct": round(current_close_profit * 100, 2),
-                    "holding_days": len(bars_to_process[: bars_to_process.index(bar) + 1]),
-                    "exit_reason": "take_profit_drawdown",
-                    "max_profit_pct": round(historical_max_profit * 100, 2),
-                }
+
+        # 新策略：不再看 30% 回撤，只要收盘价跌破 MA20 就止盈/止损出局
+        if ma20_price > 0 and close_price < ma20_price:
+            return {
+                "entry_date": entry_date,
+                "exit_date": trade_date,
+                "exit_price": round(close_price, 4),
+                "return_pct": round(current_close_profit * 100, 2),
+                "holding_days": len(bars_to_process[: bars_to_process.index(bar) + 1]),
+                "exit_reason": "break_ma20",
+                "max_profit_pct": round(historical_max_profit * 100, 2),
+            }
 
         if current_close_profit > max_profit:
             max_profit = current_close_profit
@@ -253,28 +383,32 @@ def simulate_trade_from_bars(
 
 
 def simulate_trade(
-    conn: sqlite3.Connection,
+    cache: MarketDataCache,
     review_date: str,
     signal: dict,
     max_hold_days: int = 0,
 ) -> dict:
     entry_price = float(signal["close"])
-    future_bars = load_future_bars(conn, signal["code"], review_date)
-    trade_result = simulate_trade_from_bars(review_date, entry_price, future_bars, max_hold_days=max_hold_days)
+    future_bars = cache.get_future_bars(signal["code"], review_date)
+    raw_result = simulate_trade_from_bars(review_date, entry_price, future_bars, max_hold_days=max_hold_days)
     signal_names = [item[0] for item in signal["signals"]]
-    trade_result.update(
-        {
-            "code": signal["code"],
-            "name": signal["name"],
-            "board": signal["board"],
-            "score": signal["score"],
-            "entry_price": round(entry_price, 4),
-            "cross_type": signal["cross_type_cn"],
-            "signals": "; ".join(signal_names),
-            "has_pullback_shrink_twice": any(name.startswith("60日内两次缩量下跌") for name in signal_names),
-        }
-    )
-    return trade_result
+    return {
+        "entry_date": raw_result["entry_date"],
+        "exit_date": raw_result["exit_date"],
+        "entry_price": round(entry_price, 4),
+        "exit_price": raw_result["exit_price"],
+        "return_pct": raw_result["return_pct"],
+        "holding_days": raw_result["holding_days"],
+        "exit_reason": raw_result["exit_reason"],
+        "max_profit_pct": raw_result["max_profit_pct"],
+        "code": signal["code"],
+        "name": signal["name"],
+        "board": signal["board"],
+        "score": signal["score"],
+        "cross_type": signal["cross_type_cn"],
+        "signals": "; ".join(signal_names),
+        "has_pullback_shrink_twice": any(name.startswith("60日内两次缩量下跌") for name in signal_names),
+    }
 
 
 def summarize_trades(trades: list[dict]) -> dict:
@@ -301,8 +435,8 @@ def summarize_trades(trades: list[dict]) -> dict:
         "avg_holding_days": round(float(holding_days.mean()), 2),
         "best_trade_pct": round(float(returns.max()), 2),
         "worst_trade_pct": round(float(returns.min()), 2),
-        "take_profit_count": sum(1 for item in trades if item["exit_reason"] == "take_profit_drawdown"),
-        "stop_loss_count": sum(1 for item in trades if item["exit_reason"] == "stop_loss"),
+        "take_profit_count": sum(1 for item in trades if item["exit_reason"] == "break_ma20" and item["return_pct"] > 0),
+        "stop_loss_count": sum(1 for item in trades if item["exit_reason"] in ("stop_loss", "break_ma20") and item["return_pct"] <= 0),
     }
 
 
@@ -380,33 +514,60 @@ def build_portfolio_equity_curve(
     curve_rows: list[dict] = []
     realized_pnl = 0.0
 
-    for trade_date in trading_dates:
+    total_dates = len(trading_dates)
+    for i, trade_date in enumerate(trading_dates):
         for trade in exits_by_date.get(trade_date, []):
             position_key = (str(trade["code"]), str(trade["entry_date"]))
             position = open_positions.pop(position_key, None)
             if position is None:
                 continue
             exit_value = position["shares"] * float(trade["exit_price"])
-            pnl_amount = exit_value - position["cost"]
-            cash += exit_value
+            
+            # 手续费和印花税计算
+            sell_commission = max(5.0, exit_value * 0.0003) # 万3，最低5元
+            stamp_tax = exit_value * 0.001 # 印花税千1
+            net_exit_value = exit_value - sell_commission - stamp_tax
+            
+            pnl_amount = net_exit_value - position["cost"]
+            cash += net_exit_value
             realized_pnl += pnl_amount
             position["executed_exit_price"] = float(trade["exit_price"])
             position["realized_pnl"] = round(pnl_amount, 2)
+            position["sell_commission"] = round(sell_commission, 2)
+            position["stamp_tax"] = round(stamp_tax, 2)
 
         for trade in entries_by_date.get(trade_date, []):
-            if len(open_positions) >= max_positions or cash < position_size:
+            if any(p["code"] == trade["code"] for p in open_positions.values()):
+                skipped_trades.append({**trade, "skip_reason": "already_holding"})
+                continue
+            
+            # 买入手续费万3，最低5元
+            buy_commission = max(5.0, position_size * 0.0003)
+            total_cost = position_size + buy_commission
+
+            if len(open_positions) >= max_positions or cash < total_cost:
                 skipped_trades.append({**trade, "skip_reason": "capital_or_position_limit"})
                 continue
+            
             entry_price = float(trade["entry_price"])
-            shares = position_size / entry_price
-            cash -= position_size
+            shares = int(position_size / entry_price / 100) * 100 # 按手数（100股）取整向下
+            if shares == 0:
+                skipped_trades.append({**trade, "skip_reason": "insufficient_capital_for_100_shares"})
+                continue
+            
+            actual_position_size = shares * entry_price
+            buy_commission = max(5.0, actual_position_size * 0.0003)
+            actual_total_cost = actual_position_size + buy_commission
+            
+            cash -= actual_total_cost
             position_key = (str(trade["code"]), str(trade["entry_date"]))
             open_positions[position_key] = {
                 **trade,
                 "shares": shares,
-                "cost": position_size,
+                "cost": actual_total_cost,
+                "buy_commission": round(buy_commission, 2)
             }
-            executed_trades.append({**trade, "allocated_capital": round(position_size, 2), "shares": round(shares, 6)})
+            executed_trades.append({**trade, "allocated_capital": round(actual_total_cost, 2), "shares": shares})
 
         market_value = 0.0
         for position in open_positions.values():
@@ -416,6 +577,9 @@ def build_portfolio_equity_curve(
             market_value += position["shares"] * close_price
 
         equity = cash + market_value
+        pct = (equity / initial_capital) * 100
+        print(f"\rAllocating Portfolio: {i + 1}/{total_dates} ({trade_date}) - Equity: {pct:.2f}%", end="", flush=True)
+
         curve_rows.append(
             {
                 "date": trade_date,
@@ -427,6 +591,7 @@ def build_portfolio_equity_curve(
                 "realized_pnl": round(realized_pnl, 2),
             }
         )
+    print()
 
     portfolio_summary = summarize_equity_curve(curve_rows, executed_trades, skipped_trades)
     return executed_trades, skipped_trades, curve_rows, portfolio_summary
@@ -499,33 +664,52 @@ def run_backtest(
     initial_capital: float = DEFAULT_INITIAL_CAPITAL,
     position_size: float = DEFAULT_POSITION_SIZE,
     max_positions: int = DEFAULT_MAX_POSITIONS,
+    cache: MarketDataCache | None = None,
 ) -> dict:
     start_trade_date = parse_review_date(start_date)[0] if start_date else None
     end_trade_date = parse_review_date(end_date)[0] if end_date else None
-    conn = get_db_connection()
-    review_dates = load_backtest_dates(conn, start_trade_date, end_trade_date)
+    
+    if cache is None:
+        conn = get_db_connection()
+        cache = MarketDataCache(conn, start_trade_date, end_trade_date)
+        conn.close()
+        
+    review_dates = cache.review_dates
 
     trades: list[dict] = []
     signal_rows: list[dict] = []
     cooldown_until_by_code: dict[str, str] = {}
-    for review_date in review_dates:
-        signals = build_daily_signals(
-            conn,
+    holding_until_by_code: dict[str, str] = {}
+    total_dates = len(review_dates)
+    for i, review_date in enumerate(review_dates):
+        print(f"\rScanning Signals [{scoring_mode}]: {i + 1}/{total_dates} {review_date} - Matched: {len(trades)} trades", end="", flush=True)
+        signals = build_daily_signals_cached(
+            cache,
             review_date,
             top_n=top_n,
             limit=limit,
             include_all_boards=include_all_boards,
             scoring_mode=scoring_mode,
+            is_backtest=True,
         )
         for signal in signals:
+            code_str = str(signal["code"])
+            # 如果这只股票处于被持仓的状态，则在卖出之前不再响应它的新信号
+            if holding_until_by_code.get(code_str) and review_date <= holding_until_by_code[code_str]:
+                continue
             if should_skip_signal_for_cooldown(review_date, signal, cooldown_until_by_code):
                 continue
             signal_rows.append({"run_date": review_date, **signal})
-            trade = simulate_trade(conn, review_date, signal, max_hold_days=max_hold_days)
+            trade = simulate_trade(cache, review_date, signal, max_hold_days=max_hold_days)
             trades.append(trade)
-            if trade["exit_reason"] == "take_profit_drawdown":
+            
+            # 记录这笔独立交易的下车时间，在它下车前不再买它
+            holding_until_by_code[code_str] = str(trade["exit_date"])
+            
+            if trade["exit_reason"] == "break_ma20" and trade["return_pct"] > 0:
                 cooldown_until = (pd.Timestamp(trade["exit_date"]) + timedelta(days=TAKE_PROFIT_COOLDOWN_DAYS)).strftime("%Y-%m-%d")
                 cooldown_until_by_code[str(trade["code"])] = cooldown_until
+    print()  # 换行结束进度条显示
 
     overall_summary = summarize_trades(trades)
     shrink_trades = [item for item in trades if item["has_pullback_shrink_twice"]]
@@ -537,8 +721,9 @@ def run_backtest(
     effective_end = review_dates[-1] if review_dates else end_trade_date or "na"
     file_suffix = f"{effective_start.replace('-', '')}_{effective_end.replace('-', '')}"
     portfolio_end_date = max((str(item["exit_date"]) for item in trades), default=effective_end)
-    close_lookup = build_close_lookup(conn, sorted({str(item["code"]) for item in trades}), effective_start, portfolio_end_date)
-    portfolio_trading_dates = load_backtest_dates(conn, effective_start, portfolio_end_date)
+    close_lookup = cache.get_close_lookup(set([str(item["code"]) for item in trades]), effective_start, portfolio_end_date)
+    portfolio_trading_dates = [d for d in cache.review_dates if effective_start <= d <= portfolio_end_date]
+    
     executed_trades, skipped_trades, equity_curve_rows, portfolio_summary = build_portfolio_equity_curve(
         trades,
         portfolio_trading_dates,
@@ -547,8 +732,6 @@ def run_backtest(
         position_size=position_size,
         max_positions=max_positions,
     )
-
-    conn.close()
 
     trade_csv_path = BACKTEST_DIR / f"backtest_trades_{scoring_mode}_{file_suffix}.csv"
     signal_csv_path = BACKTEST_DIR / f"backtest_signals_{scoring_mode}_{file_suffix}.csv"
@@ -582,7 +765,7 @@ def run_backtest(
     notes = [
         "买点使用信号当日收盘价，只在尾盘买入。",
         "止损使用本金回撤 10%，一旦后续日线最低价触及止损价，按止损价卖出。",
-        "止盈使用盈利回撤 30%，按后续每日收盘价相对历史最大浮盈做回撤判断。",
+        f"动态止盈：当最大浮盈突破 {int(TRAILING_PROFIT_ACTIVATION * 100)}% 后激活。此后利润从最高点回撤 {int(TRAILING_PROFIT_DRAWDOWN * 100)}%（即保留 {int((1-TRAILING_PROFIT_DRAWDOWN)*100)}% 利润）时止盈离场。",
         f"若股票因止盈卖出，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
         "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交额过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
         "若直到数据末尾仍未触发卖出，则按最后一个可用收盘价平仓。",
@@ -603,6 +786,13 @@ def compare_scoring_modes(
     position_size: float = DEFAULT_POSITION_SIZE,
     max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> dict:
+    start_trade_date = parse_review_date(start_date)[0] if start_date else None
+    end_trade_date = parse_review_date(end_date)[0] if end_date else None
+    
+    conn = get_db_connection()
+    cache = MarketDataCache(conn, start_trade_date, end_trade_date)
+    conn.close()
+    
     legacy_summary = run_backtest(
         start_date=start_date,
         end_date=end_date,
@@ -614,6 +804,7 @@ def compare_scoring_modes(
         initial_capital=initial_capital,
         position_size=position_size,
         max_positions=max_positions,
+        cache=cache,
     )
     dedup_summary = run_backtest(
         start_date=start_date,
@@ -626,6 +817,7 @@ def compare_scoring_modes(
         initial_capital=initial_capital,
         position_size=position_size,
         max_positions=max_positions,
+        cache=cache,
     )
     compare_summary = {
         "start_date": legacy_summary["start_date"],

@@ -139,12 +139,18 @@ def get_shrinking_down_day_volumes(
 
     recent_close = close.iloc[-lookback:]
     recent_volume = volume.iloc[-lookback:]
+    
+    # 寻找这 60 天内的“前高”（收盘价最高点）所在索引
+    # 这样回踩的时间段就被严格限制在 MIN(60, 距离前高的天数)
+    pre_high_idx = int(recent_close.argmax())
+    
     volume_mean = recent_volume.mean()
     if volume_mean <= 0 or math.isnan(volume_mean):
         return []
 
     shrinking_down_volumes: list[float] = []
-    for index in range(1, len(recent_close)):
+    # 只从“前高”那一天之后开始往后统计缩量回踩，之前的缩量将不纳入本次统计
+    for index in range(pre_high_idx + 1, len(recent_close)):
         is_down_day = recent_close.iloc[index] < recent_close.iloc[index - 1]
         volume_value = recent_volume.iloc[index]
         prev_volume = recent_volume.iloc[index - 1]
@@ -238,8 +244,20 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
     amount = kline["amount"].astype(float)
     high = kline["high"].astype(float)
 
-    ma5 = calc_ma(close, MA_SHORT)
-    ma20 = calc_ma(close, MA_LONG)
+    if "ma5" in kline.columns:
+        ma5 = kline["ma5"].astype(float)
+        ma20 = kline["ma20"].astype(float)
+        ma10 = kline["ma10"].astype(float)
+        ma60 = kline["ma60"].astype(float)
+        rsi_val = float(kline["rsi"].iloc[-1])
+    else:
+        ma5 = calc_ma(close, MA_SHORT)
+        ma20 = calc_ma(close, MA_LONG)
+        ma10 = calc_ma(close, 10)
+        ma60 = calc_ma(close, 60)
+        rsi = calc_rsi(close)
+        rsi_val = float(rsi.iloc[-1])
+
     if pd.isna(ma5.iloc[-1]) or pd.isna(ma20.iloc[-1]) or ma5.iloc[-1] <= ma20.iloc[-1]:
         return None
 
@@ -249,8 +267,6 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
 
     angle = calc_ma_angle(ma5.iloc[-1], ma20.iloc[-1], ma5.iloc[-2], ma20.iloc[-2])
 
-    ma10 = calc_ma(close, 10)
-    ma60 = calc_ma(close, 60)
     bullish_alignment = bool(
         not pd.isna(ma10.iloc[-1])
         and not pd.isna(ma60.iloc[-1])
@@ -267,8 +283,6 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
     if bias > MAX_BIAS_RATIO:
         return None
 
-    rsi = calc_rsi(close)
-    rsi_val = rsi.iloc[-1]
     if pd.isna(rsi_val) or rsi_val > MAX_RSI:
         return None
 

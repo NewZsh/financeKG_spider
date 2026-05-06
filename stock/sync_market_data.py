@@ -29,9 +29,14 @@ import sqlite3
 import sys
 import threading
 import time
+import socket
 import mplfinance as mpf
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# 设置全局默认的 socket 超时时间，防止底层库（如 akshare 使用 requests 未设超时）无限期挂起
+socket.setdefaulttimeout(60.0)
+
 from typing import Dict, List, Optional, Tuple, Any
 
 import akshare
@@ -121,6 +126,8 @@ class Utils:
                 return fetcher()
             except Exception as exc:
                 last_error = exc
+                sys.stdout.write(f"\n[网络提醒] {label} 请求异常 (第{attempt}/{attempts}次重试) - {exc}\n")
+                sys.stdout.flush()
                 if attempt == attempts:
                     break
                 time.sleep(delay_seconds * attempt)
@@ -307,11 +314,12 @@ class StockMarketSyncEngine:
     """
     行情同步引擎，负责控制整个市场的股票列表刷新及行情的全量或增量爬取写入
     """
-    def __init__(self, mode: str = "incremental", limit: int = 0, force_full_adjust: bool = False, request_pause: float = 0.15):
+    def __init__(self, mode: str = "incremental", limit: int = 0, force_full_adjust: bool = False, request_pause: float = 0.15, only_existing_before: Optional[str] = None):
         self.mode = mode
         self.limit = limit
         self.force_full_adjust = force_full_adjust
         self.request_pause = request_pause
+        self.only_existing_before = only_existing_before
         self.db_lock = threading.Lock()
         self.summary_lock = threading.Lock()
         self.summary = {
@@ -320,29 +328,59 @@ class StockMarketSyncEngine:
             "spot_enriched_codes": 0, "full_refresh_codes": [], "adjustment_event_updates": 0, "errors": []
         }
 
-    def _get_progress_data(self) -> dict:
-        if PROGRESS_PATH.exists():
-            try:
-                return json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
+    def _get_completed_codes(self, end_trade_date: str) -> set[str]:
+        if self.force_full_adjust:
+            return set()
+            
+        trade_days = MarketDataFetcher.fetch_trade_days()
+        if not trade_days:
+            expected_trade_date = end_trade_date
+        else:
+            valid_days = [d for d in trade_days if d <= end_trade_date]
+            expected_trade_date = max(valid_days) if valid_days else end_trade_date
+            
+        conn = DbManager.get_connection()
+        try:
+            query = """
+                SELECT a.code
+                FROM (SELECT code FROM daily_bars WHERE trade_date >= ? AND adjust_type = 'none') a
+                INNER JOIN (SELECT DISTINCT code FROM daily_bars WHERE trade_date >= ? AND adjust_type = 'qfq') b
+                ON a.code = b.code
+            """
+            rows = conn.execute(query, (expected_trade_date, expected_trade_date)).fetchall()
+            return set(r[0] for r in rows)
+        except Exception:
+            return set()
+        finally:
+            conn.close()
 
-    def _save_progress_data(self, data: dict):
-        PROGRESS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _mark_code_completed(self, task_key: str, code: str):
+        pass  # 现已全自动通过数据库真实记录作为快照恢复起点
 
-    def run_sync(self, review_date: Optional[str] = None) -> dict:
+    def run_sync(self, review_date: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
         """主同步逻辑"""
-        trade_date, compact_date = Utils.parse_sync_date(review_date)
-        end_date = compact_date
-        is_full = self.mode == "full"
-        daily_start_date = FULL_REFRESH_START if is_full else compact_date
-        
-        target_dt = datetime.strptime(trade_date, "%Y-%m-%d")
-        intra_start = (target_dt - timedelta(days=INTRADAY_FETCH_WINDOW_DAYS)).strftime("%Y-%m-%d 09:30:00") if is_full else f"{trade_date} 09:30:00"
-        intra_end = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00") if is_full else f"{trade_date} 15:00:00"
+        if review_date and not end_date:
+            end_date = review_date
+        if not end_date and not start_date:
+            end_date = Utils.parse_sync_date(None)[0]
+        if end_date and not start_date:
+            start_date = end_date
+        if start_date and not end_date:
+            end_date = start_date
 
-        self.summary["review_date"] = trade_date
+        start_trade_date, start_compact_date = Utils.parse_sync_date(start_date)
+        end_trade_date, end_compact_date = Utils.parse_sync_date(end_date)
+        
+        is_full = self.mode == "full"
+        daily_start_date = FULL_REFRESH_START if is_full else start_compact_date
+        
+        target_dt_start = datetime.strptime(start_trade_date, "%Y-%m-%d")
+        target_dt_end = datetime.strptime(end_trade_date, "%Y-%m-%d")
+
+        intra_start = (target_dt_end - timedelta(days=INTRADAY_FETCH_WINDOW_DAYS)).strftime("%Y-%m-%d 09:30:00") if is_full else f"{start_trade_date} 09:30:00"
+        intra_end = (target_dt_end + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00")
+
+        self.summary["review_date"] = f"{start_trade_date} ~ {end_trade_date}"
         self.summary["db_path"] = str(DB_PATH)
 
         conn = DbManager.get_connection()
@@ -351,20 +389,19 @@ class StockMarketSyncEngine:
         
         sync_df = stocks_df.head(self.limit).copy() if self.limit > 0 else stocks_df.copy()
         
+        if self.only_existing_before:
+            existing_codes = self._get_completed_codes(self.only_existing_before)
+            sync_df = sync_df[sync_df["code"].astype(str).isin(existing_codes)]
+            print(f"Filtered sync list to {len(sync_df)} stocks that existed up to {self.only_existing_before}.")
+        
         # 拉取当天的腾讯分时切片以补齐最新收盘市值等信息
         tencent_spot = MarketDataFetcher.fetch_tencent_realtime(sync_df["code"].tolist())
 
         total_tasks = len(sync_df)
         
-        task_key = f"{trade_date}_{self.mode}_{self.force_full_adjust}"
-        progress_data = self._get_progress_data()
-        
-        if progress_data.get("task_key") != task_key:
-            progress_data = {"task_key": task_key, "completed_codes": []}
-            self._save_progress_data(progress_data)
-            
-        completed_codes = set(progress_data["completed_codes"])
+        completed_codes = self._get_completed_codes(end_trade_date)
         completed_tasks = len(completed_codes)
+        task_key = "DEPRECATED"
 
         # 清除针对这批股票的缓存
         for _, row in sync_df.iterrows():
@@ -376,7 +413,7 @@ class StockMarketSyncEngine:
                 continue
                 
             self._process_single_stock(
-                conn=conn, code=code_str, trade_date=trade_date, daily_start_date=daily_start_date, end_date=end_date,
+                conn=conn, code=code_str, trade_date=end_trade_date, daily_start_date=daily_start_date, end_date=end_compact_date,
                 intra_start=intra_start, intra_end=intra_end,
                 tencent_spot=tencent_spot,
                 is_full=is_full
@@ -387,9 +424,7 @@ class StockMarketSyncEngine:
             
             # 使用锁保存进度，防止多线程时冲突导致文件损坏（如果是单线程此时无锁也安全）
             with self.summary_lock:
-                completed_codes.add(code_str)
-                progress_data["completed_codes"] = list(completed_codes)
-                self._save_progress_data(progress_data)
+                self._mark_code_completed(task_key, code_str)
         
         sys.stdout.write("\n")
         conn.close()
@@ -497,12 +532,7 @@ class StockMarketSyncEngine:
         return len(rows)
 
     def _replace_qfq_history(self, conn: sqlite3.Connection, code: str, bars_df: pd.DataFrame) -> int:
-        if bars_df.empty: return 0
-        rows = [(code, r.date, "qfq", r.open, r.high, r.low, r.close, r.volume, r.amount) for r in bars_df.itertuples(index=False)]
-        with conn:
-            conn.execute("DELETE FROM daily_bars WHERE code = ? AND adjust_type = 'qfq'", (code,))
-            conn.executemany("INSERT INTO daily_bars(code, trade_date, adjust_type, open, high, low, close, volume, amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-        return len(rows)
+        return self._upsert_daily_bars(conn, code, "qfq", bars_df)
 
     def _get_existing_adjustment_events(self, conn: sqlite3.Connection, code: str) -> List[Tuple[str, float]]:
         rows = conn.execute("SELECT event_date, qfq_factor FROM adjustment_events WHERE code = ? ORDER BY event_date", (code,)).fetchall()
@@ -522,26 +552,31 @@ class StockMarketSyncEngine:
 
     def _replace_intraday_bars(self, conn: sqlite3.Connection, code: str, intra_df: pd.DataFrame) -> int:
         if intra_df.empty: return 0
-        trade_dates = sorted({str(v) for v in intra_df["trade_date"].dropna()})
         rows = [(code, r.trade_date, r.trade_time, r.trade_timestamp, r.open, r.close, r.high, r.low, r.avg_price, r.volume, r.amount, r.change_pct, r.change_amount, Utils.now_ts()) for r in intra_df.itertuples(index=False)]
-        with conn:
-            for td in trade_dates:
-                conn.execute("DELETE FROM intraday_bars WHERE code = ? AND trade_date = ?", (code, td))
-            conn.executemany("""
-                INSERT INTO intraday_bars(code, trade_date, trade_time, trade_timestamp, open, close, high, low, avg_price, volume, amount, change_pct, change_amount, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, rows)
+        conn.executemany("""
+            INSERT INTO intraday_bars(code, trade_date, trade_time, trade_timestamp, open, close, high, low, avg_price, volume, amount, change_pct, change_amount, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code, trade_timestamp) DO UPDATE SET 
+                trade_date=excluded.trade_date, trade_time=excluded.trade_time,
+                open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low,
+                avg_price=excluded.avg_price, volume=excluded.volume, amount=excluded.amount,
+                change_pct=excluded.change_pct, change_amount=excluded.change_amount,
+                fetched_at=excluded.fetched_at
+        """, rows)
+        conn.commit()
         return len(rows)
 
     def _replace_daily_distributions(self, conn: sqlite3.Connection, code: str, distributions: List[dict]) -> int:
         if not distributions: return 0
         ts = Utils.now_ts()
-        with conn:
-            conn.executemany("DELETE FROM daily_price_distributions WHERE code = ? AND trade_date = ?", [(code, i["date"]) for i in distributions])
-            conn.executemany("""
-                INSERT INTO daily_price_distributions(code, trade_date, summary_json, buy_sell_bins_json, price_histogram_json, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, [(code, i["date"], json.dumps(i["summary"], ensure_ascii=False), json.dumps(i["buy_sell_bins"], ensure_ascii=False), json.dumps(i["price_histogram"], ensure_ascii=False), ts) for i in distributions])
+        conn.executemany("""
+            INSERT INTO daily_price_distributions(code, trade_date, summary_json, buy_sell_bins_json, price_histogram_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code, trade_date) DO UPDATE SET 
+                summary_json=excluded.summary_json, buy_sell_bins_json=excluded.buy_sell_bins_json,
+                price_histogram_json=excluded.price_histogram_json, fetched_at=excluded.fetched_at
+        """, [(code, i["date"], json.dumps(i["summary"], ensure_ascii=False), json.dumps(i["buy_sell_bins"], ensure_ascii=False), json.dumps(i["price_histogram"], ensure_ascii=False), ts) for i in distributions])
+        conn.commit()
         return len(distributions)
 
     def _merge_daily_spot(self, trade_date: str, bars_df: pd.DataFrame, spot: dict) -> pd.DataFrame:
@@ -702,7 +737,9 @@ class StockMarketDataReader:
 
     @staticmethod
     def plot_kline(code: str, limit: int = 120) -> None:
-        """展示给定股票的前复权 K 线图及移动平均线（MA5, MA10, MA20）"""
+        """展示给定股票的前复权 K 线图及移动平均线（MA5, MA10, MA20）
+        limit 参数控制展示的日线数量，默认120条（约半年交易日）
+        """
         conn = DbManager.get_connection()
         try:
             query = "SELECT trade_date, open, high, low, close, volume FROM daily_bars WHERE code = ? AND adjust_type = 'qfq' ORDER BY trade_date DESC LIMIT ?"
@@ -720,32 +757,62 @@ class StockMarketDataReader:
         # mplfinance 要求列名为大写首字母
         df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
 
-        mpf.plot(df, type='candle', mav=(5, 10, 20), volume=True,
-                 title=f"Stock K-Line: {code}",
-                 style='yahoo',
-                 show_nontrading=False)
+        # 计算均线以便点击时能够在控制台中打印
+        df["MA5"] = df["Close"].rolling(window=5).mean()
+        df["MA10"] = df["Close"].rolling(window=10).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+
+        # style: 红色上涨绿色下跌
+        fig, axes = mpf.plot(df, type='candle', mav=(5, 10, 20), volume=True,
+                             title=f"Stock K-Line: {code}",
+                             style=mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mpf.make_marketcolors(up='r', down='g', inherit=True)),
+                             show_nontrading=False,
+                             returnfig=True)
+
+        def on_click(event):
+            # 判断是否点击在坐标轴内，并且能获取到 x 坐标 (通过 show_nontrading=False 绘制时，x 坐标对应的是 DataFrame 的整数索引)
+            if event.inaxes and event.xdata is not None:
+                idx = int(round(event.xdata))
+                if 0 <= idx < len(df):
+                    row = df.iloc[idx]
+                    date_str = df.index[idx].strftime('%Y-%m-%d')
+                    ma5 = f"{row['MA5']:.2f}" if not pd.isna(row['MA5']) else "N/A"
+                    ma10 = f"{row['MA10']:.2f}" if not pd.isna(row['MA10']) else "N/A"
+                    ma20 = f"{row['MA20']:.2f}" if not pd.isna(row['MA20']) else "N/A"
+                    sys.stdout.write(f"\n[{date_str}] 开盘: {row['Open']:.2f}, 收盘: {row['Close']:.2f}, "
+                                     f"最高: {row['High']:.2f}, 最低: {row['Low']:.2f}, 成交量: {row['Volume']}, "
+                                     f"MA5: {ma5}, MA10: {ma10}, MA20: {ma20}")
+                    sys.stdout.flush()
+
+        fig.canvas.mpl_connect('button_press_event', on_click)
+        mpf.show()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="同步 A 股行情到 SQLite")
-    parser.add_argument("--date", type=str, default=None, help="同步日期，格式 YYYYMMDD 或 YYYY-MM-DD")
-    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental", help="incremental 仅拉当日，full 全量刷新到当日")
+    parser.add_argument("--date", type=str, default=None, help="[向前兼容] 同步结束日期，等同于 --end-date。格式 YYYYMMDD 或 YYYY-MM-DD")
+    parser.add_argument("--start-date", type=str, default=None, help="起始同步日期（适用于 incremental 补历史段数据）。格式 YYYYMMDD 或 YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, default=None, help="结束同步日期。格式 YYYYMMDD 或 YYYY-MM-DD")
+    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental", help="incremental 仅拉区间内的增量数据，full 从头拉取全部历史")
     parser.add_argument("--limit", type=int, default=0, help="仅同步前 N 只股票，便于调试")
     parser.add_argument("--force-full-adjust", action="store_true", help="强制所有股票重刷前复权历史")
+    parser.add_argument("--only-existing-before", type=str, default=None, help="仅同步在指定日期已经同步完成的股票")
     parser.add_argument("--plot", type=str, default=None, help="输入股票代码（如 000001），直接拉取库中数据并展示K线图（不会进行同步操作）")
     args = parser.parse_args()
 
     if args.plot:
-        StockMarketDataReader.plot_kline(args.plot, limit=120)
+        StockMarketDataReader.plot_kline(args.plot, limit=300)
         return
 
     engine = StockMarketSyncEngine(
         mode=args.mode,
         limit=args.limit,
-        force_full_adjust=args.force_full_adjust
+        force_full_adjust=args.force_full_adjust,
+        only_existing_before=args.only_existing_before
     )
     
-    summary = engine.run_sync(review_date=args.date)
+    actual_end_date = args.end_date or args.date
+    summary = engine.run_sync(start_date=args.start_date, end_date=actual_end_date)
 
     print(
         f"同步完成[{summary['mode']}]: 股票 {summary['synced_codes']} 只, 当日现货补齐 {summary['spot_enriched_codes']} 只, "
