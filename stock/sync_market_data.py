@@ -42,7 +42,7 @@ from pathlib import Path
 # 设置全局默认的 socket 超时时间，防止网络请求无限期挂起
 socket.setdefaulttimeout(60.0)
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 import akshare
 import pandas as pd

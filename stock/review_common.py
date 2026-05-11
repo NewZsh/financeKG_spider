@@ -24,17 +24,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sqlite3
-import time
 import traceback
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-import requests
-
 
 SIGNAL_WEIGHTS = {
     "golden_cross_first": 50,

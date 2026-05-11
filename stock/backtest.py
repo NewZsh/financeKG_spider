@@ -821,9 +821,10 @@ def run_backtest(
     notes = [
         "买点使用信号当日收盘价，只在尾盘买入。",
         "止损使用本金回撤 10%，一旦后续日线最低价触及止损价，按止损价卖出。",
-        f"动态止盈：当最大浮盈突破 {int(TRAILING_PROFIT_ACTIVATION * 100)}% 后激活。此后利润从最高点回撤 {int(TRAILING_PROFIT_DRAWDOWN * 100)}%（即保留 {int((1-TRAILING_PROFIT_DRAWDOWN)*100)}% 利润）时止盈离场。",
-        f"若股票因止盈卖出，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
+        "出场规则改为趋势止盈/止损：只要后续任一交易日收盘价跌破 MA20，即按当日收盘价离场。",
+        f"若股票因跌破 MA20 获利离场，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
         "默认策略：只交易包含‘60日内两次缩量下跌’的信号。",
+        "同一只股票在前一笔交易尚未出场前，不会响应新的重复信号。",
         "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交量过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
         "若直到数据末尾仍未触发卖出，则按最后一个可用收盘价平仓。",
         f"组合资金曲线使用初始资金 {initial_capital}、单笔仓位 {position_size}、最大持仓数 {max_positions}。",
