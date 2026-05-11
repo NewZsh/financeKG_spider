@@ -24,12 +24,17 @@ SIGNAL_WEIGHTS = {
     "rsi_ok": 5,
     "bias_low": 10,
     "bias_ok": 5,
+    "liquidity_low": -20,
+    "liquidity_moderate": 8,
+    "liquidity_good": 20,
+    "liquidity_hot": -10,
 }
 
 GROUP_SCORE_CAPS = {
     "trend_confirmation": 50, # 提升上限以容纳爆发倍量加分
     "position_quality": 10,
     "market_cap": 30, # 新增的大市值专项加分上限（最大容许加30分）
+    "liquidity": 20,
 }
 
 DEDUP_MIN_SIGNAL_SCORE = 85
@@ -55,6 +60,13 @@ BREAKOUT_VOLUME_VS_PULLBACK_RATIO = 2.0
 LOOKBACK_DAYS = 120
 MA_SHORT = 5
 MA_LONG = 20
+GOLDEN_CROSS_DECAY_DAYS = 20
+GOLDEN_CROSS_DECAY_FLOOR = 0.1
+MARKET_CAP_PENALTY_THRESHOLD_YI = 2000
+LIQUIDITY_RATIO_MIN_PCT = 2.0
+LIQUIDITY_RATIO_GOOD_LOW_PCT = 5.0
+LIQUIDITY_RATIO_GOOD_HIGH_PCT = 15.0
+LIQUIDITY_RATIO_RISK_PCT = 30.0
 
 
 def calc_ma(series: pd.Series, window: int) -> pd.Series:
@@ -79,15 +91,45 @@ def calc_ma_angle(ma_short_val: float, ma_long_val: float, ma_short_prev: float,
         return 0.0
 
 
-def detect_golden_cross_type(ma5: pd.Series, ma20: pd.Series, close: pd.Series) -> str:
+def calc_golden_cross_decay_factor(cross_age: int, decay_days: int = GOLDEN_CROSS_DECAY_DAYS) -> float:
+    if cross_age <= 0:
+        return 1.0
+    if cross_age >= decay_days:
+        return GOLDEN_CROSS_DECAY_FLOOR
+    return GOLDEN_CROSS_DECAY_FLOOR ** (cross_age / decay_days)
+
+
+def score_liquidity_ratio(liquidity_ratio_pct: float | None) -> tuple[str | None, int]:
+    if liquidity_ratio_pct is None:
+        return None, 0
+
+    ratio = float(liquidity_ratio_pct)
+    if ratio < LIQUIDITY_RATIO_MIN_PCT:
+        penalty = -max(1, int(round((LIQUIDITY_RATIO_MIN_PCT - ratio) / LIQUIDITY_RATIO_MIN_PCT * 20)))
+        return f"流动性不足({ratio:.1f}%)", penalty
+    if ratio < LIQUIDITY_RATIO_GOOD_LOW_PCT:
+        score = int(round((ratio - LIQUIDITY_RATIO_MIN_PCT) / (LIQUIDITY_RATIO_GOOD_LOW_PCT - LIQUIDITY_RATIO_MIN_PCT) * 8))
+        return f"流动性起步({ratio:.1f}%)", score
+    if ratio <= LIQUIDITY_RATIO_GOOD_HIGH_PCT:
+        score = 8 + int(round((ratio - LIQUIDITY_RATIO_GOOD_LOW_PCT) / (LIQUIDITY_RATIO_GOOD_HIGH_PCT - LIQUIDITY_RATIO_GOOD_LOW_PCT) * 12))
+        return f"流动性良好({ratio:.1f}%)", score
+    if ratio <= LIQUIDITY_RATIO_RISK_PCT:
+        score = 20 - int(round((ratio - LIQUIDITY_RATIO_GOOD_HIGH_PCT) / (LIQUIDITY_RATIO_RISK_PCT - LIQUIDITY_RATIO_GOOD_HIGH_PCT) * 30))
+        return f"流动性偏热({ratio:.1f}%)", score
+
+    penalty = -10 - int(round(min((ratio - LIQUIDITY_RATIO_RISK_PCT) / 10 * 10, 10)))
+    return f"流动性过热({ratio:.1f}%)", penalty
+
+
+def detect_golden_cross_type_and_age(ma5: pd.Series, ma20: pd.Series, close: pd.Series) -> tuple[str, int | None]:
     n = len(ma5)
     if n < MA_LONG + 5:
-        return "none"
+        return "none", None
     if pd.isna(ma5.iloc[-1]) or pd.isna(ma20.iloc[-1]) or ma5.iloc[-1] <= ma20.iloc[-1]:
-        return "none"
+        return "none", None
 
     cross_idx = None
-    for index in range(n - 1, max(0, n - 10), -1):
+    for index in range(n - 1, max(0, n - GOLDEN_CROSS_DECAY_DAYS - 1), -1):
         if index - 1 < 0:
             break
         if any(pd.isna(series.iloc[index]) or pd.isna(series.iloc[index - 1]) for series in (ma5, ma20)):
@@ -97,7 +139,7 @@ def detect_golden_cross_type(ma5: pd.Series, ma20: pd.Series, close: pd.Series) 
             break
 
     if cross_idx is None:
-        for index in range(max(0, n - 10), max(0, n - 60), -1):
+        for index in range(max(0, n - GOLDEN_CROSS_DECAY_DAYS - 1), max(0, n - 60), -1):
             if index - 1 < 0:
                 break
             if any(pd.isna(series.iloc[index]) or pd.isna(series.iloc[index - 1]) for series in (ma5, ma20)):
@@ -107,16 +149,16 @@ def detect_golden_cross_type(ma5: pd.Series, ma20: pd.Series, close: pd.Series) 
                 break
 
     if cross_idx is None:
-        return "none"
+        return "none", None
 
     cross_age = n - 1 - cross_idx
-    if cross_age > 10:
-        return "none"
+    if cross_age > GOLDEN_CROSS_DECAY_DAYS:
+        return "none", None
 
     lookback = min(60, len(close))
     low_60 = close.iloc[-lookback:].min()
     if low_60 > 0 and (close.iloc[-1] / low_60 - 1) > 0.30:
-        return "high"
+        return "high", cross_age
 
     start = max(0, cross_idx - min(30, n - 1))
     for index in range(cross_idx - 1, start, -1):
@@ -125,9 +167,14 @@ def detect_golden_cross_type(ma5: pd.Series, ma20: pd.Series, close: pd.Series) 
         if any(pd.isna(series.iloc[index]) or pd.isna(series.iloc[index - 1]) for series in (ma5, ma20)):
             continue
         if ma5.iloc[index] < ma20.iloc[index] and ma5.iloc[index - 1] >= ma20.iloc[index - 1]:
-            return "second"
+            return "second", cross_age
 
-    return "first"
+    return "first", cross_age
+
+
+def detect_golden_cross_type(ma5: pd.Series, ma20: pd.Series, close: pd.Series) -> str:
+    cross_type, _ = detect_golden_cross_type_and_age(ma5, ma20, close)
+    return cross_type
 
 
 def get_shrinking_down_day_volumes(
@@ -185,7 +232,7 @@ def build_dedup_score_components(score_components: dict[str, list[tuple[str, int
         "base": list(score_components.get("base", [])),
     }
 
-    for group_name in ("trend_confirmation", "position_quality", "market_cap"):
+    for group_name in ("trend_confirmation", "position_quality", "market_cap", "liquidity"):
         group_items = score_components.get(group_name, [])
         positive_components = sorted((item for item in group_items if item[1] > 0), key=lambda item: item[1], reverse=True)
         negative_components = [item for item in group_items if item[1] < 0]
@@ -237,12 +284,19 @@ def build_space_to_high_penalty_components(space_to_high: float, breakout_ready_
     return components
 
 
-def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str = "dedup", float_mv_yi: float = None) -> dict | None:
+def analyze_stock(
+    code: str,
+    name: str,
+    kline: pd.DataFrame,
+    scoring_mode: str = "dedup",
+    float_mv_yi: float = None,
+    liquidity_ratio_pct: float | None = None,
+) -> dict | None:
     if kline.empty or len(kline) < MA_LONG + 5:
         return None
 
     close = kline["close"].astype(float)
-    amount = kline["amount"].astype(float)
+    volume = kline["volume"].astype(float)
     high = kline["high"].astype(float)
 
     if "ma5" in kline.columns:
@@ -262,9 +316,10 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
     if pd.isna(ma5.iloc[-1]) or pd.isna(ma20.iloc[-1]) or ma5.iloc[-1] <= ma20.iloc[-1]:
         return None
 
-    cross_type = detect_golden_cross_type(ma5, ma20, close)
+    cross_type, cross_age = detect_golden_cross_type_and_age(ma5, ma20, close)
     if cross_type == "none":
         return None
+    cross_decay_factor = calc_golden_cross_decay_factor(cross_age or 0)
 
     angle = calc_ma_angle(ma5.iloc[-1], ma20.iloc[-1], ma5.iloc[-2], ma20.iloc[-2])
 
@@ -274,12 +329,17 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         and ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1] > ma60.iloc[-1]
     )
 
-    if len(amount) < 21:
+    if len(volume) < 21:
         return None
-    avg_amount_20 = amount.iloc[-21:-1].mean()
-    if avg_amount_20 == 0 or math.isnan(avg_amount_20):
+    avg_volume_20 = volume.iloc[-21:-1].mean()
+    if avg_volume_20 == 0 or math.isnan(avg_volume_20):
         return None
-    vol_ratio = amount.iloc[-1] / avg_amount_20
+    vol_ratio = volume.iloc[-1] / avg_volume_20
+    is_up_day = (
+        len(close) >= 2
+        and float(kline["close"].iloc[-1]) > float(kline["open"].iloc[-1])
+        and close.iloc[-1] > close.iloc[-2]
+    )
     bias = (close.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]
 
     if pd.isna(rsi_val) or rsi_val > MAX_RSI:
@@ -295,13 +355,13 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         space_to_high=float(space_to_high),
     )
 
-    shrinking_down_volumes = get_shrinking_down_day_volumes(close, amount)
+    shrinking_down_volumes = get_shrinking_down_day_volumes(close, volume)
     shrinking_down_count = len(shrinking_down_volumes)
     breakout_multiplier = 0.0
     if shrinking_down_count >= SHRINKING_DOWN_MIN_COUNT:
         max_shrink_vol = max(shrinking_down_volumes)
         if max_shrink_vol > 0:
-            breakout_multiplier = amount.iloc[-1] / max_shrink_vol
+            breakout_multiplier = volume.iloc[-1] / max_shrink_vol
             if breakout_multiplier < 1.0:
                 return None
 
@@ -310,13 +370,14 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         "trend_confirmation": [],
         "position_quality": [],
         "market_cap": [],
+        "liquidity": [],
     }
     if cross_type == "first":
-        score_components["base"].append(("首次金叉", SIGNAL_WEIGHTS["golden_cross_first"]))
+        score_components["base"].append(("首次金叉", max(1, int(SIGNAL_WEIGHTS["golden_cross_first"] * cross_decay_factor))))
     elif cross_type == "second":
-        score_components["base"].append(("二次金叉", SIGNAL_WEIGHTS["golden_cross_second"]))
+        score_components["base"].append(("二次金叉", max(1, int(SIGNAL_WEIGHTS["golden_cross_second"] * cross_decay_factor))))
     elif cross_type == "high":
-        score_components["base"].append(("高位金叉", SIGNAL_WEIGHTS["golden_cross_high"]))
+        score_components["base"].append(("高位金叉", max(1, int(SIGNAL_WEIGHTS["golden_cross_high"] * cross_decay_factor))))
 
     if breakout_ready_second_cross:
         score_components["base"].append(("临近前高的强二次金叉", SIGNAL_WEIGHTS["second_cross_breakout_ready"]))
@@ -333,14 +394,15 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
             if bonus > 0:
                 score_components["trend_confirmation"].append((f"爆发倍量({breakout_multiplier:.2f}x)", bonus))
 
-    if vol_ratio >= 2.0:
-        score_components["trend_confirmation"].append((f"强放量突破({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_strong"]))
-    elif vol_ratio >= VOLUME_BREAKOUT:
-        score_components["trend_confirmation"].append((f"放量突破({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_breakout"]))
-    elif vol_ratio >= VOLUME_MODERATE:
-        score_components["trend_confirmation"].append((f"温和放量({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_moderate"]))
-    elif vol_ratio >= VOLUME_WEAK:
-        score_components["trend_confirmation"].append((f"轻度放量({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_light"]))
+    if is_up_day:
+        if vol_ratio >= 2.0:
+            score_components["trend_confirmation"].append((f"强放量突破({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_strong"]))
+        elif vol_ratio >= VOLUME_BREAKOUT:
+            score_components["trend_confirmation"].append((f"放量突破({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_breakout"]))
+        elif vol_ratio >= VOLUME_MODERATE:
+            score_components["trend_confirmation"].append((f"温和放量({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_moderate"]))
+        elif vol_ratio >= VOLUME_WEAK:
+            score_components["trend_confirmation"].append((f"轻度放量({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_light"]))
 
     if angle > 15:
         score_components["trend_confirmation"].append((f"强势夹角({angle}°)", SIGNAL_WEIGHTS["ma_angle_strong"]))
@@ -365,12 +427,15 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
     if float_mv_yi is not None:
         if float_mv_yi < 20:
             return None # 20亿以下一票否决
-        # 20亿以上的按照对数函数的走势加分，市值越大加分越多，但边际效益递减
-        # 公式: log10(市值 / 20) * 10
-        # 举例: 20亿=0分, 100亿≈+7分, 500亿≈+14分, 2000亿=+20分, 1万亿≈+27分
-        mv_bonus = int(math.log10(float_mv_yi / 20) * 10)
-        if mv_bonus > 0:
-            score_components["market_cap"].append((f"大市值加分({float_mv_yi:.1f}亿)", mv_bonus))
+        if float_mv_yi > MARKET_CAP_PENALTY_THRESHOLD_YI:
+            # 超过 2000 亿后开始扣分，市值越大扣得越多，但保持对数级增长，避免过度惩罚。
+            excess_scale = math.log10(float_mv_yi / MARKET_CAP_PENALTY_THRESHOLD_YI)
+            mv_penalty = -max(1, int(excess_scale * 12))
+            score_components["market_cap"].append((f"超大市值扣分({float_mv_yi:.1f}亿)", mv_penalty))
+
+    liquidity_label, liquidity_score = score_liquidity_ratio(liquidity_ratio_pct)
+    if liquidity_label is not None:
+        score_components["liquidity"].append((liquidity_label, liquidity_score))
 
     legacy_score, legacy_signals, legacy_group_scores = summarize_score_components(score_components)
     dedup_score_components = build_dedup_score_components(score_components)
@@ -414,4 +479,5 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
             "legacy": legacy_group_scores,
             "dedup": dedup_group_scores,
         },
+        "liquidity_ratio_pct": round(float(liquidity_ratio_pct), 2) if liquidity_ratio_pct is not None else None,
     }

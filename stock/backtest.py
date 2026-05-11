@@ -1,5 +1,36 @@
 #!/usr/bin/env python3
 
+"""基于历史日线回放选股信号，并执行事件回测。
+
+参数：
+    --start-date: 回测起始日期，格式 YYYYMMDD 或 YYYY-MM-DD
+    --end-date: 回测结束日期，格式 YYYYMMDD 或 YYYY-MM-DD
+    --top-n: 每天取前 N 个信号参与回测
+    --limit: 仅分析前 N 只候选股票，便于调试
+    --all-boards: 分析全部板块，不限制默认允许板块
+    --max-hold-days: 最大持有天数，0 表示直到触发卖点或数据结束
+    --scoring-mode: 评分模式，legacy 或 dedup
+    --compare-modes: 同时回测 legacy 和 dedup 两种评分模式
+    --initial-capital: 组合回测初始资金
+    --position-size: 单笔固定仓位
+    --max-positions: 最大同时持仓数
+
+用法：
+    - 回测指定时间段：
+        python -m stock.backtest --start-date 2024-01-01 --end-date 2024-12-31
+
+    - 每天只取前 20 个信号，并仅分析前 100 只候选股票：
+        python -m stock.backtest --top-n 20 --limit 100
+
+    - 同时对比 legacy 和 dedup 两种评分模式：
+        python -m stock.backtest --compare-modes
+
+注意：
+    - 回测依赖本地 SQLite 中的日线、股票信息和最新流通市值数据
+    - 默认使用 dedup 评分模式，以减少重复信号带来的权重膨胀
+    - 回测会按历史日期逐日回放，避免使用未来数据
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -43,6 +74,7 @@ TAKE_PROFIT_COOLDOWN_DAYS = 30
 DEFAULT_INITIAL_CAPITAL = 100000.0
 DEFAULT_POSITION_SIZE = 10000.0
 DEFAULT_MAX_POSITIONS = 10
+MIN_BACKTEST_HISTORY_ROWS = 20
 
 
 class MarketDataCache:
@@ -58,18 +90,20 @@ class MarketDataCache:
             }
         
         params = []
-        date_cond = ""
+        date_conditions = []
         if start_trade_date:
             start_dt = pd.Timestamp(start_trade_date) - pd.Timedelta(days=250)
-            date_cond = "AND trade_date >= ?"
+            date_conditions.append("trade_date >= ?")
             params.append(start_dt.strftime("%Y-%m-%d"))
         if end_trade_date:
-            date_cond += " AND trade_date <= ?"
+            date_conditions.append("trade_date <= ?")
             params.append(end_trade_date)
             
-        # NOTE: volume from daily_bars is not strictly required by compute_indicators (only amount),
-        # but loaded for API completeness
-        query = f"SELECT code, trade_date as date, open, high, low, close, volume, amount FROM daily_bars {date_cond} ORDER BY code, trade_date"
+        # NOTE: daily_bars now stores volume only; amount is kept as a runtime alias for compatibility.
+        query = "SELECT code, trade_date as date, open, high, low, close, volume, volume AS amount FROM daily_bars"
+        if date_conditions:
+            query += " WHERE " + " AND ".join(date_conditions)
+        query += " ORDER BY code, trade_date"
         
         print(f"=> Preloading daily bars [{start_trade_date or 'ALL'} ~ {end_trade_date or 'ALL'}]...", flush=True)
         df = pd.read_sql_query(query, conn, params=params)
@@ -159,16 +193,19 @@ def build_daily_signals_cached(
         if not include_all_boards and info["board"] not in ALLOWED_BOARDS:
             continue
 
+        if info["is_st"]:
+            continue
+
         idx = df["date"].searchsorted(review_date, side="right")
-        if idx < LOOKBACK_DAYS // 2:
+        if idx < MIN_BACKTEST_HISTORY_ROWS:
             continue
             
         current_bar = df.iloc[idx - 1]
         if current_bar["date"] != review_date:
             continue
             
-        amount_wan = current_bar["amount"] / 10000.0
-        if amount_wan < MIN_DAILY_AMOUNT:
+        volume = float(current_bar["volume"])
+        if volume < MIN_DAILY_AMOUNT:
             continue
             
         float_mv = info["float_mv_yi"]
@@ -184,7 +221,7 @@ def build_daily_signals_cached(
             result["high"] = round(float(current_bar["high"]), 2)
             result["low"] = round(float(current_bar["low"]), 2)
             result["float_mv_yi"] = round(float(float_mv), 2) if float_mv is not None else None
-            result["amount_wan"] = round(float(amount_wan), 2)
+            result["volume"] = round(float(volume), 2)
             candidates.append(result)
         count += 1
 
@@ -213,7 +250,7 @@ def load_backtest_candidates(
                 high,
                 low,
                 close,
-                amount,
+                volume,
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc
             FROM daily_bars
             WHERE trade_date <= ?
@@ -235,14 +272,14 @@ def load_backtest_candidates(
                 WHEN ldb.previous_close_calc IS NOT NULL AND ldb.previous_close_calc > 0 THEN ((ldb.close / ldb.previous_close_calc) - 1) * 100
                 ELSE NULL
             END AS pct_change,
-            ldb.amount / 10000.0 AS amount_wan,
+            ldb.volume AS volume,
             lmv.float_mv_yi
         FROM stocks s
         INNER JOIN latest_day_bars ldb ON ldb.code = s.code
         LEFT JOIN latest_market_value lmv ON lmv.code = s.code
         WHERE s.is_st = 0
           {board_condition}
-          AND ldb.amount / 10000.0 >= ?
+                    AND ldb.volume >= ?
           AND (lmv.float_mv_yi IS NULL OR lmv.float_mv_yi BETWEEN ? AND ?)
         ORDER BY s.code
     """
@@ -257,7 +294,7 @@ def load_qfq_bars_as_of(
     required_rows: int = LOOKBACK_DAYS + 80,
 ) -> pd.DataFrame:
     query = """
-        SELECT trade_date AS date, open, high, low, close, volume, amount
+        SELECT trade_date AS date, open, high, low, close, volume, volume AS amount
         FROM daily_bars
         WHERE code = ? AND trade_date <= ?
         ORDER BY trade_date
@@ -283,7 +320,7 @@ def build_daily_signals(
     results: list[dict] = []
     for row in candidates:
         kline = load_qfq_bars_as_of(conn, row["code"], review_date)
-        if kline.empty or len(kline) < LOOKBACK_DAYS // 2:
+        if kline.empty or len(kline) < MIN_BACKTEST_HISTORY_ROWS:
             continue
         result = analyze_stock(row["code"], row["name"], kline, scoring_mode=scoring_mode)
         if result is None:
@@ -293,7 +330,7 @@ def build_daily_signals(
         result["high"] = round(float(row["high"]), 2) if row["high"] is not None else None
         result["low"] = round(float(row["low"]), 2) if row["low"] is not None else None
         result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
-        result["amount_wan"] = round(float(row["amount_wan"]), 2) if row["amount_wan"] is not None else None
+        result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
         results.append(result)
 
     results.sort(key=lambda item: item["score"], reverse=True)
@@ -766,7 +803,7 @@ def run_backtest(
         "止损使用本金回撤 10%，一旦后续日线最低价触及止损价，按止损价卖出。",
         f"动态止盈：当最大浮盈突破 {int(TRAILING_PROFIT_ACTIVATION * 100)}% 后激活。此后利润从最高点回撤 {int(TRAILING_PROFIT_DRAWDOWN * 100)}%（即保留 {int((1-TRAILING_PROFIT_DRAWDOWN)*100)}% 利润）时止盈离场。",
         f"若股票因止盈卖出，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
-        "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交额过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
+        "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交量过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
         "若直到数据末尾仍未触发卖出，则按最后一个可用收盘价平仓。",
         f"组合资金曲线使用初始资金 {initial_capital}、单笔仓位 {position_size}、最大持仓数 {max_positions}。",
     ]

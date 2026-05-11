@@ -128,6 +128,17 @@ def safe_float(value: Any) -> Optional[float]:
     return round(number, 4)
 
 
+def fill_daily_amount(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "volume" not in df.columns:
+        return df
+    data = df.copy()
+    data["volume"] = pd.to_numeric(data["volume"], errors="coerce")
+    data["amount"] = data["volume"]
+    return data
+
+
 def retry_call(fetcher, *, label: str, attempts: int = 3, delay_seconds: float = 1.2) -> Any:
     """具备重试机制的数据抓取包装器"""
     last_error = None
@@ -332,27 +343,51 @@ class DbManager:
     @staticmethod
     def ensure_latest_market_value_schema(conn: sqlite3.Connection) -> None:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(latest_market_value)").fetchall()}
-        if "fetched_at" not in columns:
-            return
-        conn.execute("ALTER TABLE latest_market_value RENAME TO latest_market_value_legacy_migrating")
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS latest_market_value (
-                code TEXT PRIMARY KEY,
-                trade_date TEXT NOT NULL,
-                float_mv_yi REAL NOT NULL,
-                FOREIGN KEY (code) REFERENCES stocks(code)
-            );
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO latest_market_value(code, trade_date, float_mv_yi)
-            SELECT code, trade_date, float_mv_yi
-            FROM latest_market_value_legacy_migrating
-            """
-        )
-        conn.execute("DROP TABLE latest_market_value_legacy_migrating")
+        if "amount_wan" not in columns:
+            if "fetched_at" in columns:
+                conn.execute("ALTER TABLE latest_market_value RENAME TO latest_market_value_legacy_migrating")
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS latest_market_value (
+                        code TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        amount_wan REAL,
+                        float_mv_yi REAL NOT NULL,
+                        FOREIGN KEY (code) REFERENCES stocks(code)
+                    );
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO latest_market_value(code, trade_date, amount_wan, float_mv_yi)
+                    SELECT code, trade_date, NULL AS amount_wan, float_mv_yi
+                    FROM latest_market_value_legacy_migrating
+                    """
+                )
+                conn.execute("DROP TABLE latest_market_value_legacy_migrating")
+            else:
+                conn.execute("ALTER TABLE latest_market_value ADD COLUMN amount_wan REAL")
+        elif "fetched_at" in columns:
+            conn.execute("ALTER TABLE latest_market_value RENAME TO latest_market_value_legacy_migrating")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS latest_market_value (
+                    code TEXT PRIMARY KEY,
+                    trade_date TEXT NOT NULL,
+                    amount_wan REAL,
+                    float_mv_yi REAL NOT NULL,
+                    FOREIGN KEY (code) REFERENCES stocks(code)
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO latest_market_value(code, trade_date, amount_wan, float_mv_yi)
+                SELECT code, trade_date, NULL AS amount_wan, float_mv_yi
+                FROM latest_market_value_legacy_migrating
+                """
+            )
+            conn.execute("DROP TABLE latest_market_value_legacy_migrating")
 
     @staticmethod
     def ensure_daily_bar_schema(conn: sqlite3.Connection) -> None:
@@ -380,7 +415,6 @@ class DbManager:
                     low REAL,
                     close REAL,
                     volume REAL,
-                    amount REAL,
                     PRIMARY KEY (code, trade_date)
                 )
                 """
@@ -390,8 +424,8 @@ class DbManager:
                 if "adjust_type" in columns:
                     conn.execute(
                         f"""
-                        INSERT OR REPLACE INTO daily_bars_tmp_migrating(code, trade_date, open, high, low, close, volume, amount)
-                        SELECT code, trade_date, open, high, low, close, volume, amount
+                        INSERT OR REPLACE INTO daily_bars_tmp_migrating(code, trade_date, open, high, low, close, volume)
+                        SELECT code, trade_date, open, high, low, close, volume
                         FROM {table_name}
                         WHERE adjust_type = 'qfq'
                         """
@@ -399,8 +433,8 @@ class DbManager:
                 else:
                     conn.execute(
                         f"""
-                        INSERT OR REPLACE INTO daily_bars_tmp_migrating(code, trade_date, open, high, low, close, volume, amount)
-                        SELECT code, trade_date, open, high, low, close, volume, amount
+                        INSERT OR REPLACE INTO daily_bars_tmp_migrating(code, trade_date, open, high, low, close, volume)
+                        SELECT code, trade_date, open, high, low, close, volume
                         FROM {table_name}
                         """
                     )
@@ -408,8 +442,8 @@ class DbManager:
             conn.execute("DELETE FROM daily_bars")
             conn.execute(
                 """
-                INSERT OR REPLACE INTO daily_bars(code, trade_date, open, high, low, close, volume, amount)
-                SELECT code, trade_date, open, high, low, close, volume, amount
+                INSERT OR REPLACE INTO daily_bars(code, trade_date, open, high, low, close, volume)
+                SELECT code, trade_date, open, high, low, close, volume
                 FROM daily_bars_tmp_migrating
                 """
             )
@@ -421,10 +455,21 @@ class DbManager:
             conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
             conn.execute(
                 """
-                INSERT OR REPLACE INTO daily_bars(code, trade_date, open, high, low, close, volume, amount)
-                SELECT code, trade_date, open, high, low, close, volume, amount
+                INSERT OR REPLACE INTO daily_bars(code, trade_date, open, high, low, close, volume)
+                SELECT code, trade_date, open, high, low, close, volume
                 FROM daily_bars_legacy_migrating
                 WHERE adjust_type = 'qfq'
+                """
+            )
+            conn.execute("DROP TABLE daily_bars_legacy_migrating")
+        elif "amount" in columns:
+            conn.execute("ALTER TABLE daily_bars RENAME TO daily_bars_legacy_migrating")
+            conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO daily_bars(code, trade_date, open, high, low, close, volume)
+                SELECT code, trade_date, open, high, low, close, volume
+                FROM daily_bars_legacy_migrating
                 """
             )
             conn.execute("DROP TABLE daily_bars_legacy_migrating")
@@ -554,24 +599,12 @@ class MarketDataFetcher:
                         continue
                     code_str = parts[2]
                     try:
-                        price = float(parts[3]) if parts[3] else 0
-                        open_price = float(parts[5]) if parts[5] else 0
-                        pct_change = float(parts[32]) if parts[32] else 0
-                        high_price = float(parts[33]) if parts[33] else 0
-                        low_price = float(parts[34]) if parts[34] else 0
                         amount_wan = float(parts[37]) if parts[37] else 0
                         float_mv_yi = float(parts[44]) if parts[44] else 0
                     except (TypeError, ValueError):
                         continue
-                    if price <= 0:
-                        continue
                     result[code_str] = {
                         "name": parts[1],
-                        "price": price,
-                        "open": open_price,
-                        "high": high_price,
-                        "low": low_price,
-                        "pct_change": pct_change,
                         "amount_wan": amount_wan,
                         "float_mv_yi": float_mv_yi,
                     }
@@ -586,7 +619,7 @@ class MarketDataFetcher:
         cache_path = MarketDataFetcher._cache_path(f"daily_bars:{code}:{start_date}:{end_date}:{adjust}")
         cached = load_pickle_cache(cache_path, DAILY_BARS_CACHE_TTL_SECONDS)
         if isinstance(cached, pd.DataFrame) and not cached.empty:
-            return cached.copy()
+            return fill_daily_amount(cached.copy())
             
         symbol = to_symbol(code)
         adjust_type = "qfq" if adjust == "qfq" else ""
@@ -632,7 +665,7 @@ class MarketDataFetcher:
         if not all_data:
             cached = MarketDataFetcher._load_stale_cache(cache_path, f"{code} 日线行情获取({adjust})")
             if isinstance(cached, pd.DataFrame) and not cached.empty:
-                return cached.copy()
+                return fill_daily_amount(cached.copy())
             return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "amount"])
             
         # Re-reverse to chronological order
@@ -648,10 +681,10 @@ class MarketDataFetcher:
                     "high": float(row[3]),
                     "low": float(row[4]),
                     "volume": float(row[5]),
-                    "amount": float(row[6]) if len(row) > 6 and isinstance(row[6], (str, int, float)) else 0.0
                 })
         
         df = pd.DataFrame(records)
+        df = fill_daily_amount(df)
         normalized = MarketDataFetcher._normalize_daily_bars_df(df)
         if not normalized.empty:
             save_pickle_cache(cache_path, normalized)
@@ -910,6 +943,7 @@ class StockMarketSyncEngine:
             "intraday_bar_rows": 0, 
             "distribution_rows": 0,
             "full_refresh_codes": [], 
+            "coverage_backfill_codes": [],
             "adjustment_event_updates": 0, 
             "skipped_daily_codes": 0,
             "retry_attempted_codes": 0,
@@ -979,8 +1013,15 @@ class StockMarketSyncEngine:
         error_message = None
         try:
             spot = tencent_spot.get(code) if enable_spot_enrichment else None
+            current_market_value_date = datetime.now().strftime("%Y-%m-%d")
             if spot and spot.get("float_mv_yi"):
-                self._upsert_latest_market_value(conn, code, end_trade_date, spot["float_mv_yi"])
+                self._upsert_latest_market_value(
+                    conn,
+                    code,
+                    current_market_value_date,
+                    spot.get("amount_wan"),
+                    spot["float_mv_yi"],
+                )
 
             coverage_row = self._get_daily_bar_coverage(conn, code)
             oldest_db_record = conn.execute(
@@ -1030,7 +1071,10 @@ class StockMarketSyncEngine:
                     qfq_bars = MarketDataFetcher.fetch_daily_bars(code, start_date=fetch_start_date, end_date=end_trade_date, adjust="qfq")
                     if needs_full:
                         qfq_rows = self._replace_qfq_history(conn, code, qfq_bars)
-                        self.summary["full_refresh_codes"].append(code)
+                        if signature_changed:
+                            self.summary["full_refresh_codes"].append(code)
+                        else:
+                            self.summary["coverage_backfill_codes"].append(code)
                     else:
                         qfq_rows = self._upsert_daily_bars(conn, code, "qfq", qfq_bars)
                     self.summary["daily_bar_rows"] += qfq_rows
@@ -1064,11 +1108,21 @@ class StockMarketSyncEngine:
         conn.commit()
         return len(rows)
 
-    def _upsert_latest_market_value(self, conn: sqlite3.Connection, code: str, trade_date: str, float_mv_yi: float) -> None:
+    def _upsert_latest_market_value(
+        self,
+        conn: sqlite3.Connection,
+        code: str,
+        trade_date: str,
+        amount_wan: float | None,
+        float_mv_yi: float,
+    ) -> None:
         conn.execute("""
-            INSERT INTO latest_market_value(code, trade_date, float_mv_yi) VALUES (?, ?, ?)
-            ON CONFLICT(code) DO UPDATE SET trade_date=excluded.trade_date, float_mv_yi=excluded.float_mv_yi
-        """, (code, trade_date, float_mv_yi))
+            INSERT INTO latest_market_value(code, trade_date, amount_wan, float_mv_yi) VALUES (?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                trade_date=excluded.trade_date,
+                amount_wan=excluded.amount_wan,
+                float_mv_yi=excluded.float_mv_yi
+        """, (code, trade_date, amount_wan, float_mv_yi))
 
     def _upsert_daily_bars(self, conn: sqlite3.Connection, code: str, adjust_type: str, bars_df: pd.DataFrame) -> int:
         if bars_df.empty:
@@ -1076,20 +1130,19 @@ class StockMarketSyncEngine:
         if adjust_type != "qfq":
             raise ValueError(f"daily bars only support qfq, got: {adjust_type}")
         rows = [
-            (code, r.date, r.open, r.high, r.low, r.close, r.volume, r.amount)
+            (code, r.date, r.open, r.high, r.low, r.close, r.volume)
             for r in bars_df.itertuples(index=False)
         ]
         conn.executemany(
             """
-            INSERT INTO daily_bars(code, trade_date, open, high, low, close, volume, amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_bars(code, trade_date, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(code, trade_date) DO UPDATE SET
                 open=excluded.open,
                 high=excluded.high,
                 low=excluded.low,
                 close=excluded.close,
-                volume=excluded.volume,
-                amount=excluded.amount
+                volume=excluded.volume
             """,
             rows,
         )
@@ -1252,8 +1305,8 @@ class StockMarketDataReader:
 
     @staticmethod
     def _load_daily_series(conn: sqlite3.Connection, code: str, limit: int = 240) -> List[dict]:
-        rows = conn.execute("SELECT trade_date AS date, open, close, high, low, volume, amount FROM daily_bars WHERE code = ? ORDER BY trade_date DESC LIMIT ?", (code, limit)).fetchall()
-        return [{"date": str(r["date"]), "open": safe_float(r["open"]), "close": safe_float(r["close"]), "high": safe_float(r["high"]), "low": safe_float(r["low"]), "volume": safe_float(r["volume"]), "amount": safe_float(r["amount"]), "amplitude": None, "change_pct": None, "change_amount": None, "turnover_rate": None} for r in reversed(rows)]
+        rows = conn.execute("SELECT trade_date AS date, open, close, high, low, volume FROM daily_bars WHERE code = ? ORDER BY trade_date DESC LIMIT ?", (code, limit)).fetchall()
+        return [{"date": str(r["date"]), "open": safe_float(r["open"]), "close": safe_float(r["close"]), "high": safe_float(r["high"]), "low": safe_float(r["low"]), "volume": safe_float(r["volume"]), "amount": safe_float(r["volume"]), "amplitude": None, "change_pct": None, "change_amount": None, "turnover_rate": None} for r in reversed(rows)]
 
     @staticmethod
     def _load_recent_intraday_series(conn: sqlite3.Connection, code: str, lookback_days: int = INTRADAY_LOOKBACK_DAYS) -> List[dict]:

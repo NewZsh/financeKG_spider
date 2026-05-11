@@ -12,6 +12,7 @@ CREATE INDEX IF NOT EXISTS idx_stocks_board_is_st
 CREATE TABLE IF NOT EXISTS latest_market_value (
     code TEXT PRIMARY KEY,
     trade_date TEXT NOT NULL,
+    amount_wan REAL,
     float_mv_yi REAL NOT NULL,
     FOREIGN KEY (code) REFERENCES stocks(code)
 );
@@ -24,8 +25,6 @@ CREATE TABLE IF NOT EXISTS daily_bars (
     low REAL,
     close REAL,
     volume REAL,
-    amount REAL,
-    float_mv_yi REAL,
     PRIMARY KEY (code, trade_date),
     FOREIGN KEY (code) REFERENCES stocks(code)
 );

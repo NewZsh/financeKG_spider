@@ -111,10 +111,12 @@ ALLOWED_BOARDS = ["主板-沪（60）", "主板-深（00）", "中小板（002/0
 
 
 SCHEMA_MIGRATIONS = {
-    "daily_bars": {
-        "float_mv_yi": "REAL",
+    "latest_market_value": {
+        "amount_wan": "REAL",
     },
 }
+
+MIN_LIQUIDITY_RATIO_PCT = 2.0
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -164,6 +166,17 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
                 continue
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
     conn.commit()
+
+
+def calc_liquidity_ratio_pct(amount_wan: object, float_mv_yi: object) -> float | None:
+    try:
+        amount_value = float(amount_wan)
+        float_mv_value = float(float_mv_yi)
+    except (TypeError, ValueError):
+        return None
+    if amount_value <= 0 or float_mv_value <= 0:
+        return None
+    return round(amount_value / (float_mv_value * 100.0), 2)
 
 
 def classify_board(code: str) -> str:
@@ -254,23 +267,19 @@ def select_sync_candidates(stocks_df: pd.DataFrame, realtime: dict[str, dict]) -
         quote = realtime.get(row.code)
         if not quote:
             continue
-        if not (MIN_FLOAT_MV <= quote["float_mv_yi"] <= MAX_FLOAT_MV):
+        liquidity_ratio_pct = calc_liquidity_ratio_pct(quote.get("amount_wan"), quote.get("float_mv_yi"))
+        if liquidity_ratio_pct is None or liquidity_ratio_pct < MIN_LIQUIDITY_RATIO_PCT:
             continue
-        if quote["amount_wan"] < MIN_DAILY_AMOUNT:
+        if not (MIN_FLOAT_MV <= quote["float_mv_yi"] <= MAX_FLOAT_MV):
             continue
         candidates.append(
             {
                 "code": row.code,
                 "name": quote.get("name", row.name),
                 "board": row.board,
-                "price": quote["price"],
-                "open": quote.get("open"),
-                "high": quote.get("high"),
-                "low": quote.get("low"),
-                "close": quote["close"],
-                "pct_change": quote["pct_change"],
                 "amount_wan": quote["amount_wan"],
                 "float_mv_yi": quote["float_mv_yi"],
+                "liquidity_ratio_pct": liquidity_ratio_pct,
             }
         )
     return candidates
@@ -304,9 +313,10 @@ def normalize_kline_df(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {
         "vol": "volume",
         "成交量": "volume",
-        "成交额": "amount",
     }
     df = df.rename(columns=rename_map)
+    if "amount" not in df.columns and "volume" in df.columns:
+        df["amount"] = df["volume"]
     needed_columns = ["date", "open", "high", "low", "close", "volume", "amount"]
     missing = [column for column in needed_columns if column not in df.columns]
     if missing:
@@ -379,8 +389,22 @@ def build_space_to_high_penalty_components(space_to_high: float, breakout_ready_
     )
 
 
-def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str = "dedup") -> dict | None:
-    return load_indicator_api().analyze_stock(code, name, kline, scoring_mode=scoring_mode)
+def analyze_stock(
+    code: str,
+    name: str,
+    kline: pd.DataFrame,
+    scoring_mode: str = "dedup",
+    float_mv_yi: float | None = None,
+    liquidity_ratio_pct: float | None = None,
+) -> dict | None:
+    return load_indicator_api().analyze_stock(
+        code,
+        name,
+        kline,
+        scoring_mode=scoring_mode,
+        float_mv_yi=float_mv_yi,
+        liquidity_ratio_pct=liquidity_ratio_pct,
+    )
 
 
 def serialize_signals(signals: list[tuple[str, int]]) -> str:
@@ -416,8 +440,10 @@ def to_csv_rows(results: list[dict]) -> list[dict]:
                 "MA5": result["ma5"],
                 "MA20": result["ma20"],
                 "多头排列": "是" if result.get("bullish_alignment") else "否",
+                "成交额(万)": result.get("amount_wan", ""),
                 "流通市值亿": result.get("float_mv_yi", ""),
-                "成交额万": result.get("amount_wan", ""),
+                "流动性%": result.get("liquidity_ratio_pct", ""),
+                "成交量": result.get("volume", ""),
                 "信号": "; ".join(item[0] for item in sorted(result["signals"], key=lambda pair: pair[1], reverse=True)),
             }
         )
@@ -441,12 +467,22 @@ def load_candidates(conn: sqlite3.Connection, review_date: str, include_all_boar
                 high,
                 low,
                 close,
-                amount,
-                float_mv_yi,
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc,
                 ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
             FROM daily_bars
             WHERE trade_date <= ?
+        ),
+        latest_market AS (
+            SELECT
+                code,
+                amount_wan,
+                float_mv_yi,
+                CASE
+                    WHEN amount_wan IS NOT NULL AND amount_wan > 0 AND float_mv_yi IS NOT NULL AND float_mv_yi > 0
+                        THEN amount_wan / (float_mv_yi * 100.0)
+                    ELSE NULL
+                END AS liquidity_ratio_pct
+            FROM latest_market_value
         ),
         latest_daily AS (
             SELECT *
@@ -465,24 +501,27 @@ def load_candidates(conn: sqlite3.Connection, review_date: str, include_all_boar
                 WHEN ld.previous_close_calc IS NOT NULL AND ld.previous_close_calc > 0 THEN ((ld.close / ld.previous_close_calc) - 1) * 100
                 ELSE 0
             END AS pct_change,
-            ld.amount / 10000.0 AS amount_wan,
-            lmv.float_mv_yi
+            ld.volume AS volume,
+            lmv.amount_wan,
+            lmv.float_mv_yi,
+            lmv.liquidity_ratio_pct
         FROM stocks s
         INNER JOIN latest_daily ld ON ld.code = s.code
-        LEFT JOIN latest_market_value lmv ON lmv.code = s.code
+        LEFT JOIN latest_market lmv ON lmv.code = s.code
         WHERE s.is_st = 0
           {board_condition}
+          AND lmv.liquidity_ratio_pct IS NOT NULL
+          AND lmv.liquidity_ratio_pct >= ?
           AND (lmv.float_mv_yi IS NULL OR lmv.float_mv_yi BETWEEN ? AND ?)
-          AND ld.amount / 10000.0 >= ?
         ORDER BY s.code
     """
-    params.extend([MIN_FLOAT_MV, MAX_FLOAT_MV, MIN_DAILY_AMOUNT])
+    params.extend([MIN_LIQUIDITY_RATIO_PCT, MIN_FLOAT_MV, MAX_FLOAT_MV])
     return conn.execute(query, params).fetchall()
 
 
 def load_qfq_bars(conn: sqlite3.Connection, code: str, required_rows: int) -> pd.DataFrame:
     query = """
-        SELECT trade_date AS date, open, high, low, close, volume, amount
+        SELECT trade_date AS date, open, high, low, close, volume, volume AS amount
         FROM daily_bars
         WHERE code = ?
         ORDER BY trade_date
@@ -546,7 +585,14 @@ def run_compute(review_date: str | None = None, limit: int = 0, include_all_boar
             continue
         analyzed_count += 1
         float_mv_yi = row["float_mv_yi"] if "float_mv_yi" in row.keys() else None
-        result = analyze_stock(row["code"], row["name"], kline, float_mv_yi=float_mv_yi)
+        liquidity_ratio_pct = row["liquidity_ratio_pct"] if "liquidity_ratio_pct" in row.keys() else None
+        result = analyze_stock(
+            row["code"],
+            row["name"],
+            kline,
+            float_mv_yi=float_mv_yi,
+            liquidity_ratio_pct=liquidity_ratio_pct,
+        )
         if result is None:
             continue
         result["board"] = row["board"]
@@ -555,8 +601,10 @@ def run_compute(review_date: str | None = None, limit: int = 0, include_all_boar
         result["high"] = round(float(row["high"]), 2) if row["high"] is not None else None
         result["low"] = round(float(row["low"]), 2) if row["low"] is not None else None
         result["pct_change"] = round(float(row["pct_change"]), 2) if row["pct_change"] is not None else 0.0
-        result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
         result["amount_wan"] = round(float(row["amount_wan"]), 2) if row["amount_wan"] is not None else None
+        result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
+        result["liquidity_ratio_pct"] = round(float(liquidity_ratio_pct), 2) if liquidity_ratio_pct is not None else None
+        result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
         results.append(result)
 
     results.sort(key=lambda item: item["score"], reverse=True)
@@ -586,7 +634,7 @@ def load_snapshots(review_date: str | None = None) -> list[dict]:
                 high,
                 low,
                 close,
-                amount,
+                volume,
                 float_mv_yi,
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc,
                 ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
@@ -606,7 +654,7 @@ def load_snapshots(review_date: str | None = None) -> list[dict]:
             ld.high,
             ld.low,
             ld.close,
-            ld.amount / 10000.0 AS amount_wan,
+            ld.volume AS volume,
             ld.float_mv_yi,
             CASE
                 WHEN ld.previous_close_calc IS NOT NULL AND ld.previous_close_calc > 0 THEN ((ld.close / ld.previous_close_calc) - 1) * 100
