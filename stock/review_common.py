@@ -467,6 +467,7 @@ def load_candidates(conn: sqlite3.Connection, review_date: str, include_all_boar
                 high,
                 low,
                 close,
+                volume,
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc,
                 ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
             FROM daily_bars

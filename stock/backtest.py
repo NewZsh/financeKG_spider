@@ -75,6 +75,7 @@ DEFAULT_INITIAL_CAPITAL = 100000.0
 DEFAULT_POSITION_SIZE = 10000.0
 DEFAULT_MAX_POSITIONS = 10
 MIN_BACKTEST_HISTORY_ROWS = 20
+DEFAULT_STRATEGY_FILTER = "shrink_twice"
 
 
 class MarketDataCache:
@@ -176,6 +177,7 @@ def build_daily_signals_cached(
     include_all_boards: bool,
     scoring_mode: str,
     is_backtest: bool = False,
+    strategy_filter: str | None = None,
 ) -> list[dict]:
     candidates = []
     count = 0
@@ -215,6 +217,7 @@ def build_daily_signals_cached(
             
         kline = df.iloc[max(0, idx - LOOKBACK_DAYS - 80):idx]
         result = analyze_stock(code, info["name"], kline, scoring_mode=scoring_mode)
+        count += 1
         if result:
             result["board"] = info["board"]
             result["open"] = round(float(current_bar["open"]), 2)
@@ -222,8 +225,10 @@ def build_daily_signals_cached(
             result["low"] = round(float(current_bar["low"]), 2)
             result["float_mv_yi"] = round(float(float_mv), 2) if float_mv is not None else None
             result["volume"] = round(float(volume), 2)
+            result["has_pullback_shrink_twice"] = has_pullback_shrink_twice_signal(result)
+            if strategy_filter == "shrink_twice" and not result["has_pullback_shrink_twice"]:
+                continue
             candidates.append(result)
-        count += 1
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
     return candidates[:top_n]
@@ -287,6 +292,16 @@ def load_backtest_candidates(
     return conn.execute(query, params).fetchall()
 
 
+def has_pullback_shrink_twice_signal(signal: dict) -> bool:
+    for item in signal.get("signals", []):
+        if not item:
+            continue
+        name = item[0]
+        if isinstance(name, str) and name.startswith("60日内两次缩量下跌"):
+            return True
+    return False
+
+
 def load_qfq_bars_as_of(
     conn: sqlite3.Connection,
     code: str,
@@ -312,6 +327,7 @@ def build_daily_signals(
     limit: int,
     include_all_boards: bool,
     scoring_mode: str,
+    strategy_filter: str | None = None,
 ) -> list[dict]:
     candidates = load_backtest_candidates(conn, review_date, include_all_boards)
     if limit > 0:
@@ -331,6 +347,9 @@ def build_daily_signals(
         result["low"] = round(float(row["low"]), 2) if row["low"] is not None else None
         result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
         result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
+        result["has_pullback_shrink_twice"] = has_pullback_shrink_twice_signal(result)
+        if strategy_filter == "shrink_twice" and not result["has_pullback_shrink_twice"]:
+            continue
         results.append(result)
 
     results.sort(key=lambda item: item["score"], reverse=True)
@@ -727,6 +746,7 @@ def run_backtest(
             include_all_boards=include_all_boards,
             scoring_mode=scoring_mode,
             is_backtest=True,
+            strategy_filter=DEFAULT_STRATEGY_FILTER,
         )
         for signal in signals:
             code_str = str(signal["code"])
@@ -803,6 +823,7 @@ def run_backtest(
         "止损使用本金回撤 10%，一旦后续日线最低价触及止损价，按止损价卖出。",
         f"动态止盈：当最大浮盈突破 {int(TRAILING_PROFIT_ACTIVATION * 100)}% 后激活。此后利润从最高点回撤 {int(TRAILING_PROFIT_DRAWDOWN * 100)}%（即保留 {int((1-TRAILING_PROFIT_DRAWDOWN)*100)}% 利润）时止盈离场。",
         f"若股票因止盈卖出，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
+        "默认策略：只交易包含‘60日内两次缩量下跌’的信号。",
         "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交量过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
         "若直到数据末尾仍未触发卖出，则按最后一个可用收盘价平仓。",
         f"组合资金曲线使用初始资金 {initial_capital}、单笔仓位 {position_size}、最大持仓数 {max_positions}。",
