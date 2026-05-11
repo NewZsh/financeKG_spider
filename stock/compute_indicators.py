@@ -27,8 +27,9 @@ SIGNAL_WEIGHTS = {
 }
 
 GROUP_SCORE_CAPS = {
-    "trend_confirmation": 30,
+    "trend_confirmation": 50, # 提升上限以容纳爆发倍量加分
     "position_quality": 10,
+    "market_cap": 30, # 新增的大市值专项加分上限（最大容许加30分）
 }
 
 DEDUP_MIN_SIGNAL_SCORE = 85
@@ -184,7 +185,7 @@ def build_dedup_score_components(score_components: dict[str, list[tuple[str, int
         "base": list(score_components.get("base", [])),
     }
 
-    for group_name in ("trend_confirmation", "position_quality"):
+    for group_name in ("trend_confirmation", "position_quality", "market_cap"):
         group_items = score_components.get(group_name, [])
         positive_components = sorted((item for item in group_items if item[1] > 0), key=lambda item: item[1], reverse=True)
         negative_components = [item for item in group_items if item[1] < 0]
@@ -236,7 +237,7 @@ def build_space_to_high_penalty_components(space_to_high: float, breakout_ready_
     return components
 
 
-def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str = "dedup") -> dict | None:
+def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str = "dedup", float_mv_yi: float = None) -> dict | None:
     if kline.empty or len(kline) < MA_LONG + 5:
         return None
 
@@ -280,8 +281,6 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         return None
     vol_ratio = amount.iloc[-1] / avg_amount_20
     bias = (close.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]
-    if bias > MAX_BIAS_RATIO:
-        return None
 
     if pd.isna(rsi_val) or rsi_val > MAX_RSI:
         return None
@@ -298,15 +297,19 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
 
     shrinking_down_volumes = get_shrinking_down_day_volumes(close, amount)
     shrinking_down_count = len(shrinking_down_volumes)
+    breakout_multiplier = 0.0
     if shrinking_down_count >= SHRINKING_DOWN_MIN_COUNT:
-        required_breakout_amount = max(shrinking_down_volumes) * BREAKOUT_VOLUME_VS_PULLBACK_RATIO
-        if amount.iloc[-1] < required_breakout_amount:
-            return None
+        max_shrink_vol = max(shrinking_down_volumes)
+        if max_shrink_vol > 0:
+            breakout_multiplier = amount.iloc[-1] / max_shrink_vol
+            if breakout_multiplier < 1.0:
+                return None
 
     score_components: dict[str, list[tuple[str, int]]] = {
         "base": [],
         "trend_confirmation": [],
         "position_quality": [],
+        "market_cap": [],
     }
     if cross_type == "first":
         score_components["base"].append(("首次金叉", SIGNAL_WEIGHTS["golden_cross_first"]))
@@ -325,6 +328,10 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         score_components["trend_confirmation"].append(
             (f"60日内两次缩量下跌({shrinking_down_count}次)", SIGNAL_WEIGHTS["pullback_shrink_twice"])
         )
+        if breakout_multiplier >= 1.0:
+            bonus = min(int((breakout_multiplier - 1.0) * 15), 30)
+            if bonus > 0:
+                score_components["trend_confirmation"].append((f"爆发倍量({breakout_multiplier:.2f}x)", bonus))
 
     if vol_ratio >= 2.0:
         score_components["trend_confirmation"].append((f"强放量突破({vol_ratio:.1f}x)", SIGNAL_WEIGHTS["volume_strong"]))
@@ -349,6 +356,21 @@ def analyze_stock(code: str, name: str, kline: pd.DataFrame, scoring_mode: str =
         score_components["position_quality"].append((f"低乖离({bias:.1%})", SIGNAL_WEIGHTS["bias_low"]))
     elif bias < 0.10:
         score_components["position_quality"].append((f"乖离适中({bias:.1%})", SIGNAL_WEIGHTS["bias_ok"]))
+    elif bias > 0.10:
+        # 乖离率大于10%才扣分，由于越大于10%扣分的边际效益越高（二次方扣分），但在20%内不要扣太多（如 15%扣2分，20%扣8分，25%扣18分，30%扣32分）
+        excess_bias = bias - 0.10
+        bias_penalty = int((excess_bias * 100) ** 2 * -0.08) # -0.08的系数正好让 10%(excess)= -8分
+        score_components["position_quality"].append((f"乖离偏高警告({bias:.1%})", bias_penalty))
+
+    if float_mv_yi is not None:
+        if float_mv_yi < 20:
+            return None # 20亿以下一票否决
+        # 20亿以上的按照对数函数的走势加分，市值越大加分越多，但边际效益递减
+        # 公式: log10(市值 / 20) * 10
+        # 举例: 20亿=0分, 100亿≈+7分, 500亿≈+14分, 2000亿=+20分, 1万亿≈+27分
+        mv_bonus = int(math.log10(float_mv_yi / 20) * 10)
+        if mv_bonus > 0:
+            score_components["market_cap"].append((f"大市值加分({float_mv_yi:.1f}亿)", mv_bonus))
 
     legacy_score, legacy_signals, legacy_group_scores = summarize_score_components(score_components)
     dedup_score_components = build_dedup_score_components(score_components)

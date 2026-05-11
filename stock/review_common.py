@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import math
 import sqlite3
@@ -35,8 +34,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-
-ak = None
 
 
 SIGNAL_WEIGHTS = {
@@ -72,8 +69,8 @@ BREAKOUT_READY_MIN_VOLUME_RATIO = 1.8
 BREAKOUT_READY_MAX_BIAS_RATIO = 0.07
 BREAKOUT_READY_MAX_RSI = 65
 
-MIN_FLOAT_MV = 50
-MAX_FLOAT_MV = 2000
+MIN_FLOAT_MV = 20
+MAX_FLOAT_MV = 100000000
 MIN_DAILY_AMOUNT = 5000
 
 MAX_BIAS_RATIO = 0.10
@@ -132,17 +129,6 @@ def get_db_connection() -> sqlite3.Connection:
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def ensure_akshare_available() -> None:
-    global ak
-    if ak is None:
-        try:
-            ak = importlib.import_module("akshare")
-        except ImportError as exc:
-            raise RuntimeError("akshare 未安装，无法执行行情同步") from exc
-    if ak is None:
-        raise RuntimeError("akshare 未安装，无法执行行情同步")
 
 
 def normalize_trade_date(value: object) -> str:
@@ -233,14 +219,6 @@ def fetch_daily_bars(code: str, start_date: str, end_date: str, adjust: str) -> 
     return load_sync_api().fetch_daily_bars(code, start_date=start_date, end_date=end_date, adjust=adjust)
 
 
-def fetch_qfq_factor_events(code: str) -> list[tuple[str, float]]:
-    return load_sync_api().fetch_qfq_factor_events(code)
-
-
-def fetch_dividend_detail(code: str, event_date: str) -> list[tuple[str, str]]:
-    return load_sync_api().fetch_dividend_detail(code, event_date)
-
-
 def upsert_stocks(conn: sqlite3.Connection, stocks_df: pd.DataFrame) -> int:
     rows = [
         (row.code, row.name, row.board, int(row.is_st), now_ts())
@@ -268,18 +246,6 @@ def upsert_daily_bars(conn: sqlite3.Connection, code: str, adjust_type: str, bar
 
 def replace_qfq_history(conn: sqlite3.Connection, code: str, bars_df: pd.DataFrame) -> int:
     return load_sync_api().replace_qfq_history(conn, code, bars_df)
-
-
-def get_existing_adjustment_events(conn: sqlite3.Connection, code: str) -> list[tuple[str, float]]:
-    return load_sync_api().get_existing_adjustment_events(conn, code)
-
-
-def replace_adjustment_events(conn: sqlite3.Connection, code: str, events: list[tuple[str, float]]) -> None:
-    load_sync_api().replace_adjustment_events(conn, code, events)
-
-
-def replace_dividend_details(conn: sqlite3.Connection, code: str, event_date: str, items: list[tuple[str, str]]) -> None:
-    load_sync_api().replace_dividend_details(conn, code, event_date, items)
 
 
 def select_sync_candidates(stocks_df: pd.DataFrame, realtime: dict[str, dict]) -> list[dict]:
@@ -313,19 +279,16 @@ def select_sync_candidates(stocks_df: pd.DataFrame, realtime: dict[str, dict]) -
 def run_sync(
     review_date: str | None = None,
     limit: int = 0,
-    recent_days: int = SYNC_WINDOW_DAYS,
-    include_all_boards: bool = False,
-    force_full_adjust: bool = False,
     request_pause: float = 0.15,
 ) -> dict:
     sync_api = load_sync_api()
-    mode = "full" if force_full_adjust else "incremental"
-    return sync_api.run_sync(
-        review_date=review_date,
-        mode=mode,
+    engine = sync_api.StockMarketSyncEngine(
         limit=limit,
-        force_full_adjust=force_full_adjust,
         request_pause=request_pause,
+    )
+    return engine.run_sync(
+        start_date=review_date,
+        end_date=review_date,
     )
 
 
@@ -483,7 +446,7 @@ def load_candidates(conn: sqlite3.Connection, review_date: str, include_all_boar
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc,
                 ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
             FROM daily_bars
-            WHERE adjust_type = 'none' AND trade_date <= ?
+            WHERE trade_date <= ?
         ),
         latest_daily AS (
             SELECT *
@@ -503,12 +466,13 @@ def load_candidates(conn: sqlite3.Connection, review_date: str, include_all_boar
                 ELSE 0
             END AS pct_change,
             ld.amount / 10000.0 AS amount_wan,
-            ld.float_mv_yi
+            lmv.float_mv_yi
         FROM stocks s
         INNER JOIN latest_daily ld ON ld.code = s.code
+        LEFT JOIN latest_market_value lmv ON lmv.code = s.code
         WHERE s.is_st = 0
           {board_condition}
-          AND (ld.float_mv_yi IS NULL OR ld.float_mv_yi BETWEEN ? AND ?)
+          AND (lmv.float_mv_yi IS NULL OR lmv.float_mv_yi BETWEEN ? AND ?)
           AND ld.amount / 10000.0 >= ?
         ORDER BY s.code
     """
@@ -520,7 +484,7 @@ def load_qfq_bars(conn: sqlite3.Connection, code: str, required_rows: int) -> pd
     query = """
         SELECT trade_date AS date, open, high, low, close, volume, amount
         FROM daily_bars
-        WHERE code = ? AND adjust_type = 'qfq'
+        WHERE code = ?
         ORDER BY trade_date
     """
     df = pd.read_sql_query(query, conn, params=[code])
@@ -581,7 +545,8 @@ def run_compute(review_date: str | None = None, limit: int = 0, include_all_boar
             missing_kline += 1
             continue
         analyzed_count += 1
-        result = analyze_stock(row["code"], row["name"], kline)
+        float_mv_yi = row["float_mv_yi"] if "float_mv_yi" in row.keys() else None
+        result = analyze_stock(row["code"], row["name"], kline, float_mv_yi=float_mv_yi)
         if result is None:
             continue
         result["board"] = row["board"]
@@ -626,7 +591,7 @@ def load_snapshots(review_date: str | None = None) -> list[dict]:
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc,
                 ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC) AS rn
             FROM daily_bars
-            WHERE adjust_type = 'none' AND trade_date <= ?
+            WHERE trade_date <= ?
         ),
         latest_daily AS (
             SELECT *
@@ -765,7 +730,7 @@ def ensure_review_market_data_ready(review_date: str) -> dict:
     trade_date, compact_date = parse_review_date(review_date)
     status = sync_api.has_market_data_for_date(trade_date)
     status["is_trade_day"] = sync_api.is_trade_day(trade_date)
-    status["suggested_command"] = f"python -m stock.sync_market_data --mode incremental --date {compact_date}"
+    status["suggested_command"] = f"python -m stock.sync_market_data --start-date {trade_date} --end-date {trade_date}"
     if not status["is_trade_day"]:
         status["is_ready_for_review"] = True
         status["check_message"] = f"{trade_date} 非交易日，跳过当日同步校验，直接使用数据库中最近交易日数据。"

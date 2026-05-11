@@ -69,7 +69,7 @@ class MarketDataCache:
             
         # NOTE: volume from daily_bars is not strictly required by compute_indicators (only amount),
         # but loaded for API completeness
-        query = f"SELECT code, trade_date as date, open, high, low, close, volume, amount FROM daily_bars WHERE adjust_type = 'qfq' {date_cond} ORDER BY code, trade_date"
+        query = f"SELECT code, trade_date as date, open, high, low, close, volume, amount FROM daily_bars {date_cond} ORDER BY code, trade_date"
         
         print(f"=> Preloading daily bars [{start_trade_date or 'ALL'} ~ {end_trade_date or 'ALL'}]...", flush=True)
         df = pd.read_sql_query(query, conn, params=params)
@@ -117,7 +117,7 @@ def load_backtest_dates(conn: sqlite3.Connection, start_date: str | None, end_da
     query = """
         SELECT DISTINCT trade_date
         FROM daily_bars
-        WHERE adjust_type = 'qfq'
+        WHERE 1 = 1
     """
     params: list[object] = []
     conditions: list[str] = []
@@ -216,7 +216,7 @@ def load_backtest_candidates(
                 amount,
                 LAG(close) OVER (PARTITION BY code ORDER BY trade_date) AS previous_close_calc
             FROM daily_bars
-            WHERE adjust_type = 'qfq' AND trade_date <= ?
+            WHERE trade_date <= ?
         ),
         latest_day_bars AS (
             SELECT *
@@ -259,7 +259,7 @@ def load_qfq_bars_as_of(
     query = """
         SELECT trade_date AS date, open, high, low, close, volume, amount
         FROM daily_bars
-        WHERE code = ? AND adjust_type = 'qfq' AND trade_date <= ?
+        WHERE code = ? AND trade_date <= ?
         ORDER BY trade_date
     """
     df = pd.read_sql_query(query, conn, params=[code, review_date])
@@ -305,7 +305,7 @@ def load_future_bars(conn: sqlite3.Connection, code: str, review_date: str) -> l
         """
         SELECT trade_date, open, high, low, close
         FROM daily_bars
-        WHERE code = ? AND adjust_type = 'qfq' AND trade_date > ?
+        WHERE code = ? AND trade_date > ?
         ORDER BY trade_date
         """,
         (code, review_date),
@@ -456,8 +456,7 @@ def build_close_lookup(conn: sqlite3.Connection, codes: list[str], start_date: s
         f"""
         SELECT code, trade_date, close
         FROM daily_bars
-        WHERE adjust_type = 'qfq'
-          AND code IN ({placeholders})
+                WHERE code IN ({placeholders})
           AND trade_date BETWEEN ? AND ?
         ORDER BY trade_date, code
         """,
