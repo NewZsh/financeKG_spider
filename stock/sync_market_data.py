@@ -3,7 +3,6 @@
 参数：
     --start-date: 同步起始日期，格式 YYYY-MM-DD；不指定时默认使用 FULL_REFRESH_START
     --end-date: 同步结束日期，格式 YYYY-MM-DD；不指定时默认使用当天
-    --daily-only: 是否只同步日线相关数据；开启后跳过分时和价格分布。
     --limit: 仅同步前 N 只股票，便于调试，默认为 0（不限制）
 
 用法：
@@ -16,8 +15,11 @@
     - 不指定日期时，从 FULL_REFRESH_START 同步到当天：
         python -m stock.sync_market_data
 
-    - 构建全中国内地市场日线全量库：
-        python -m stock.sync_market_data --end-date 2026-05-01 --daily-only
+注意：
+    - 市值只同步本日最新的，每次运行都会刷新
+    - 日线会检查是否价格一致，如果不一致，应当是触发了复权，就会重新拉取该股票的全部日线数据（不区分前后复权），以保证数据一致性
+    - 日线的时间支持用户自己指定，通过 --start-date 和 --end-date 参数控制，默认会从 FULL_REFRESH_START 同步到当天
+    - 分时数据拉当天向前 INTRADAY_FETCH_WINDOW_DAYS 天的，前端展示时会根据日期过滤到 INTRADAY_LOOKBACK_DAYS 天内的，尽量覆盖节假日和周末带来的日期间隔问题
 """
 
 from __future__ import annotations
@@ -463,6 +465,9 @@ class DbManager:
         SCHEMA_PATH.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
+        daily_bars_kind = conn.execute("SELECT type FROM sqlite_master WHERE name = 'daily_bars'").fetchone()
+        if daily_bars_kind and str(daily_bars_kind[0]) == "view":
+            conn.execute("DROP VIEW daily_bars")
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         DbManager.ensure_legacy_tables_dropped(conn)
         DbManager.ensure_latest_market_value_schema(conn)
@@ -736,6 +741,89 @@ class MarketDataFetcher:
         return normalized
 
     @staticmethod
+    def fetch_recent_intraday_bars(code: str, lookback_days: int = INTRADAY_LOOKBACK_DAYS) -> pd.DataFrame:
+        cache_path = MarketDataFetcher._cache_path(f"intraday_recent:{code}:{lookback_days}")
+        cached = load_pickle_cache(cache_path, INTRADAY_CACHE_TTL_SECONDS)
+        if isinstance(cached, pd.DataFrame) and not cached.empty:
+            return cached.copy()
+
+        ApiRateLimiter.wait("intraday")
+        symbol = to_symbol(code)
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/day/query?code={symbol}"
+
+        def do_fetch():
+            resp = SharedHttpClient.get(url, timeout=15)
+            if resp.status_code != 200:
+                raise RuntimeError("HTTP failed")
+            return resp.json()
+
+        try:
+            data = retry_call(do_fetch, label=f"{code} 腾讯五日分时", attempts=4, delay_seconds=1.2)
+            day_entries = data.get("data", {}).get(symbol, {}).get("data", [])
+        except Exception:
+            day_entries = []
+
+        records = []
+        if day_entries:
+            recent_entries = sorted(
+                [entry for entry in day_entries if entry.get("date")],
+                key=lambda entry: str(entry.get("date")),
+            )[-lookback_days:]
+
+            for entry in recent_entries:
+                date_text = str(entry.get("date") or "")
+                if len(date_text) != 8:
+                    continue
+                date_str = f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}"
+                try:
+                    y_close = float(entry.get("prec") or 0.0)
+                except (TypeError, ValueError):
+                    y_close = 0.0
+
+                prev_vol = 0
+                prev_amt = 0.0
+                for item in entry.get("data", []):
+                    parts = str(item).split()
+                    if len(parts) < 3:
+                        continue
+                    try:
+                        hhmm = parts[0]
+                        price = float(parts[1])
+                        cum_vol = int(parts[2])
+                        cum_amt = float(parts[3]) if len(parts) > 3 else 0.0
+                    except (TypeError, ValueError):
+                        continue
+
+                    vol = cum_vol - prev_vol
+                    amt = cum_amt - prev_amt
+                    prev_vol = cum_vol
+                    prev_amt = cum_amt
+
+                    records.append({
+                        "trade_timestamp": f"{date_str} {hhmm[:2]}:{hhmm[2:]}:00",
+                        "open": price,
+                        "close": price,
+                        "high": price,
+                        "low": price,
+                        "volume": vol,
+                        "amount": amt,
+                        "change_pct": round((price - y_close) / y_close * 100, 4) if y_close else 0.0,
+                        "change_amount": round(price - y_close, 4) if y_close else 0.0,
+                        "avg_price": price,
+                    })
+
+        df = pd.DataFrame(records)
+        normalized = MarketDataFetcher._normalize_intraday_df(df)
+        if not normalized.empty:
+            save_pickle_cache(cache_path, normalized)
+            return normalized
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        fallback = MarketDataFetcher.fetch_intraday_bars(code, f"{today} 09:30:00", f"{today} 15:00:00")
+        if not fallback.empty:
+            save_pickle_cache(cache_path, fallback)
+        return fallback
+
     @staticmethod
     def _normalize_daily_bars_df(df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -787,20 +875,14 @@ class MarketDataFetcher:
 class StockMarketSyncEngine:
     """
     行情同步引擎，按串行方式同步全市场股票数据。
-
-    当前唯一的行为分支是 daily_only：
-    - False: 同步日线、分时、价格分布，并尝试用腾讯快照补齐当日行情
-    - True: 只同步日线、前复权和复权事件，适合构建复盘库
     """
     def __init__(
         self,
         limit: int = 0,
         request_pause: float = 0.15,
-        daily_only: bool = False,
     ):
         self.limit = limit
         self.request_pause = request_pause
-        self.daily_only = daily_only
 
     def _resolve_first_trade_day_on_or_after(self, value: str) -> str:
         current = datetime.strptime(value, "%Y-%m-%d")
@@ -813,18 +895,14 @@ class StockMarketSyncEngine:
         end_trade_date = parse_cli_date(end_date, fallback=datetime.now())
         start_trade_date = parse_cli_date(start_date, fallback=datetime.strptime(FULL_REFRESH_START, "%Y-%m-%d"))
 
-        end_dt = datetime.strptime(end_trade_date, "%Y-%m-%d")
-        intra_start_date = max(
-            datetime.strptime(start_trade_date, "%Y-%m-%d"),
-            end_dt - timedelta(days=INTRADAY_FETCH_WINDOW_DAYS),
-        ).strftime("%Y-%m-%d")
+        intraday_anchor_dt = datetime.now()
+        intra_start_date = (intraday_anchor_dt - timedelta(days=INTRADAY_FETCH_WINDOW_DAYS)).strftime("%Y-%m-%d")
         intra_start = f"{intra_start_date} 09:30:00"
-        intra_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00")
+        intra_end = (intraday_anchor_dt + timedelta(days=1)).strftime("%Y-%m-%d 15:00:00")
 
         self.summary = {
             "review_date": f"{start_trade_date} ~ {end_trade_date}",
             "db_path": str(DB_PATH),
-            "daily_only": self.daily_only, 
             "universe_count": 0, 
             "target_universe_count": 0,
             "synced_codes": 0, 
@@ -847,8 +925,8 @@ class StockMarketSyncEngine:
             sync_df = stocks_df.head(self.limit).copy() if self.limit > 0 else stocks_df.copy()
             self.summary["target_universe_count"] = len(sync_df)
 
-            # 日线库模式跳过腾讯快照和分时抓取，只保留复盘必需的历史数据。
-            tencent_spot = {} if self.daily_only else MarketDataFetcher.fetch_tencent_realtime(sync_df["code"].tolist())
+            # 盘中图固定取最近 5 个交易日，腾讯快照仍用于刷新最新流通市值。
+            tencent_spot = MarketDataFetcher.fetch_tencent_realtime(sync_df["code"].tolist())
             total_tasks = len(sync_df)
             completed_tasks = 0
             failed_rows: List[tuple[Any, str]] = []
@@ -863,8 +941,8 @@ class StockMarketSyncEngine:
                     conn=conn, code=code_str, start_trade_date=start_trade_date, end_trade_date=end_trade_date,
                     intra_start=intra_start, intra_end=intra_end,
                     tencent_spot=tencent_spot,
-                    enable_spot_enrichment=not self.daily_only,
-                    enable_intraday=not self.daily_only,
+                    enable_spot_enrichment=True,
+                    enable_intraday=True,
                 )
                 if error_message:
                     failed_rows.append((row, error_message))
@@ -882,8 +960,8 @@ class StockMarketSyncEngine:
                         conn=conn, code=str(row.code), start_trade_date=start_trade_date, end_trade_date=end_trade_date,
                         intra_start=intra_start, intra_end=intra_end,
                         tencent_spot=tencent_spot,
-                        enable_spot_enrichment=not self.daily_only,
-                        enable_intraday=not self.daily_only,
+                        enable_spot_enrichment=True,
+                        enable_intraday=True,
                     )
                     if retry_error:
                         self.summary["errors"].append(retry_error)
@@ -958,7 +1036,7 @@ class StockMarketSyncEngine:
                     self.summary["daily_bar_rows"] += qfq_rows
 
             if enable_intraday:
-                intra_df = MarketDataFetcher.fetch_intraday_bars(code, intra_start, intra_end)
+                intra_df = MarketDataFetcher.fetch_recent_intraday_bars(code)
                 if not intra_df.empty:
                     intra_rows = self._replace_intraday_bars(conn, code, intra_df)
                     recent_intra_df = intra_df[intra_df["trade_date"].isin(sorted(intra_df["trade_date"].unique())[-INTRADAY_LOOKBACK_DAYS:])]
@@ -1263,7 +1341,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="同步 A 股行情到 SQLite")
     parser.add_argument("--start-date", type=str, default=None, help="起始同步日期。格式 YYYY-MM-DD")
     parser.add_argument("--end-date", type=str, default=None, help="结束同步日期。格式 YYYY-MM-DD")
-    parser.add_argument("--daily-only", action="store_true", help="只同步日线相关数据，跳过分时和价格分布")
     parser.add_argument("--limit", type=int, default=0, help="仅同步前 N 只股票，便于调试")
     parser.add_argument("--plot", type=str, default=None, help="输入股票代码（如 000001），直接拉取库中数据并展示K线图（不会进行同步操作）")
     args = parser.parse_args()
@@ -1275,14 +1352,13 @@ def main() -> None:
     engine = StockMarketSyncEngine(
         limit=args.limit,
         request_pause=0.15,
-        daily_only=args.daily_only,
     )
     summary = engine.run_sync(start_date=args.start_date, end_date=args.end_date)
 
     print(
-        f"同步完成[daily_only={summary['daily_only']}]: 目标股票 {summary['target_universe_count']} 只, "
+        f"同步完成: 目标股票 {summary['target_universe_count']} 只, "
         f"实际同步 {summary['synced_codes']} 只, 日线 {summary['daily_bar_rows']} 行, "
-        f"分时 {summary['intraday_bar_rows']} 行, 分布 {summary['distribution_rows']} 条"
+        f"最近5日分时 {summary['intraday_bar_rows']} 行, 分布 {summary['distribution_rows']} 条"
     )
     print(f"核心库: {summary['db_path']}")
     if summary["full_refresh_codes"]:
