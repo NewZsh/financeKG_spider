@@ -3,6 +3,7 @@
 # Exclude data directories (raw data, downloaded files, outputs)
 data/*
 !data/README.md
+!/data/schema/stock.sql
 
 # Exclude .venv and virtual environment directories
 .venv/
