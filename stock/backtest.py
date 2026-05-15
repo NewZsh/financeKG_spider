@@ -41,7 +41,14 @@ import sqlite3
 import pandas as pd
 
 try:
-    from compute_indicators import LOOKBACK_DAYS, analyze_stock, calc_rsi
+    from compute_indicators import (
+        LOOKBACK_DAYS,
+        STRATEGY_BREAKOUT_ACCEL,
+        STRATEGY_LABELS,
+        STRATEGY_TREND_INIT,
+        analyze_stock,
+        calc_rsi,
+    )
     from review_common import (
         ALLOWED_BOARDS,
         MAX_FLOAT_MV,
@@ -53,7 +60,14 @@ try:
         to_csv_rows,
     )
 except ImportError:
-    from .compute_indicators import LOOKBACK_DAYS, analyze_stock, calc_rsi
+    from .compute_indicators import (
+        LOOKBACK_DAYS,
+        STRATEGY_BREAKOUT_ACCEL,
+        STRATEGY_LABELS,
+        STRATEGY_TREND_INIT,
+        analyze_stock,
+        calc_rsi,
+    )
     from .review_common import (
         ALLOWED_BOARDS,
         MAX_FLOAT_MV,
@@ -75,7 +89,9 @@ DEFAULT_INITIAL_CAPITAL = 100000.0
 DEFAULT_POSITION_SIZE = 10000.0
 DEFAULT_MAX_POSITIONS = 10
 MIN_BACKTEST_HISTORY_ROWS = 20
-DEFAULT_STRATEGY_FILTER = "shrink_twice"
+STRATEGY_FILTER_ALL = "all"
+STRATEGY_FILTER_CHOICES = (STRATEGY_FILTER_ALL, STRATEGY_TREND_INIT, STRATEGY_BREAKOUT_ACCEL)
+DEFAULT_STRATEGY_FILTER = STRATEGY_FILTER_ALL
 
 
 class MarketDataCache:
@@ -226,7 +242,7 @@ def build_daily_signals_cached(
             result["float_mv_yi"] = round(float(float_mv), 2) if float_mv is not None else None
             result["volume"] = round(float(volume), 2)
             result["has_pullback_shrink_twice"] = has_pullback_shrink_twice_signal(result)
-            if strategy_filter == "shrink_twice" and not result["has_pullback_shrink_twice"]:
+            if not matches_strategy_filter(result, strategy_filter):
                 continue
             candidates.append(result)
 
@@ -302,6 +318,18 @@ def has_pullback_shrink_twice_signal(signal: dict) -> bool:
     return False
 
 
+def matches_strategy_filter(signal: dict, strategy_filter: str | None) -> bool:
+    if strategy_filter in (None, STRATEGY_FILTER_ALL):
+        return True
+    return strategy_filter in (signal.get("strategy_setups") or [])
+
+
+def get_strategy_filter_label(strategy_filter: str | None) -> str:
+    if strategy_filter in (None, STRATEGY_FILTER_ALL):
+        return "全部买入策略"
+    return STRATEGY_LABELS.get(strategy_filter, str(strategy_filter))
+
+
 def load_qfq_bars_as_of(
     conn: sqlite3.Connection,
     code: str,
@@ -348,7 +376,7 @@ def build_daily_signals(
         result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
         result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
         result["has_pullback_shrink_twice"] = has_pullback_shrink_twice_signal(result)
-        if strategy_filter == "shrink_twice" and not result["has_pullback_shrink_twice"]:
+        if not matches_strategy_filter(result, strategy_filter):
             continue
         results.append(result)
 
@@ -366,6 +394,31 @@ def load_future_bars(conn: sqlite3.Connection, code: str, review_date: str) -> l
         """,
         (code, review_date),
     ).fetchall()
+
+
+def build_entry_plan(review_date: str, signal: dict, future_bars: list[sqlite3.Row | dict]) -> dict | None:
+    primary_strategy = signal.get("primary_strategy")
+    if primary_strategy == STRATEGY_BREAKOUT_ACCEL:
+        if not future_bars:
+            return None
+        confirm_bar = future_bars[0]
+        confirm_close = float(confirm_bar["close"])
+        signal_high = float(signal.get("high") or signal["close"])
+        if confirm_close <= signal_high:
+            return None
+        return {
+            "entry_date": str(confirm_bar["trade_date"]),
+            "entry_price": round(confirm_close, 4),
+            "bars": future_bars[1:],
+            "entry_rule": "next_day_confirm_breakout",
+        }
+
+    return {
+        "entry_date": review_date,
+        "entry_price": round(float(signal["close"]), 4),
+        "bars": future_bars,
+        "entry_rule": "signal_close",
+    }
 
 
 def simulate_trade_from_bars(
@@ -443,10 +496,18 @@ def simulate_trade(
     review_date: str,
     signal: dict,
     max_hold_days: int = 0,
-) -> dict:
-    entry_price = float(signal["close"])
+) -> dict | None:
     future_bars = cache.get_future_bars(signal["code"], review_date)
-    raw_result = simulate_trade_from_bars(review_date, entry_price, future_bars, max_hold_days=max_hold_days)
+    entry_plan = build_entry_plan(review_date, signal, future_bars)
+    if entry_plan is None:
+        return None
+    entry_price = float(entry_plan["entry_price"])
+    raw_result = simulate_trade_from_bars(
+        entry_plan["entry_date"],
+        entry_price,
+        entry_plan["bars"],
+        max_hold_days=max_hold_days,
+    )
     signal_names = [item[0] for item in signal["signals"]]
     return {
         "entry_date": raw_result["entry_date"],
@@ -464,6 +525,10 @@ def simulate_trade(
         "cross_type": signal["cross_type_cn"],
         "signals": "; ".join(signal_names),
         "has_pullback_shrink_twice": any(name.startswith("60日内两次缩量下跌") for name in signal_names),
+        "strategy_setups": ", ".join(signal.get("strategy_labels", [])),
+        "primary_strategy": signal.get("primary_strategy"),
+        "primary_strategy_label": signal.get("primary_strategy_label"),
+        "entry_rule": entry_plan["entry_rule"],
     }
 
 
@@ -665,6 +730,7 @@ def write_backtest_markdown(output_path: Path, summary: dict, shrink_summary: di
         f"- 止盈触发次数: {summary['overall']['take_profit_count']}",
         f"- 止损触发次数: {summary['overall']['stop_loss_count']}",
         f"- 评分模式: {summary['scoring_mode']}",
+        f"- 买入策略: {get_strategy_filter_label(summary['strategy_filter'])}",
         "",
         "## 组合资金曲线",
         "",
@@ -708,6 +774,26 @@ def write_compare_markdown(output_path: Path, compare_summary: dict) -> None:
     output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
 
+def write_strategy_compare_markdown(output_path: Path, compare_summary: dict) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    trend_init = compare_summary[STRATEGY_TREND_INIT]
+    breakout_accel = compare_summary[STRATEGY_BREAKOUT_ACCEL]
+    lines = [
+        f"# Strategy Compare {compare_summary['start_date']} - {compare_summary['end_date']}",
+        "",
+        f"- 评分模式: {compare_summary['scoring_mode']}",
+        "",
+        "| 策略 | 信号交易数 | 胜率 | 平均收益 | 组合收益率 | 最大回撤 | 最终权益 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        f"| {get_strategy_filter_label(STRATEGY_TREND_INIT)} | {trend_init['overall']['trade_count']} | {trend_init['overall']['win_rate']}% | {trend_init['overall']['avg_return_pct']}% | {trend_init['portfolio']['total_return_pct']}% | {trend_init['portfolio']['max_drawdown_pct']}% | {trend_init['portfolio']['final_equity']} |",
+        f"| {get_strategy_filter_label(STRATEGY_BREAKOUT_ACCEL)} | {breakout_accel['overall']['trade_count']} | {breakout_accel['overall']['win_rate']}% | {breakout_accel['overall']['avg_return_pct']}% | {breakout_accel['portfolio']['total_return_pct']}% | {breakout_accel['portfolio']['max_drawdown_pct']}% | {breakout_accel['portfolio']['final_equity']} |",
+        "",
+        f"- {get_strategy_filter_label(STRATEGY_TREND_INIT)}: 缩量回踩、低乖离、守 MA20、重新放量后按信号当日收盘介入。",
+        f"- {get_strategy_filter_label(STRATEGY_BREAKOUT_ACCEL)}: 二次金叉且前高附近放量，需次日收盘确认站上信号日高点后介入。",
+    ]
+    output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
 def run_backtest(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -720,6 +806,7 @@ def run_backtest(
     position_size: float = DEFAULT_POSITION_SIZE,
     max_positions: int = DEFAULT_MAX_POSITIONS,
     cache: MarketDataCache | None = None,
+    strategy_filter: str = DEFAULT_STRATEGY_FILTER,
 ) -> dict:
     start_trade_date = parse_review_date(start_date)[0] if start_date else None
     end_trade_date = parse_review_date(end_date)[0] if end_date else None
@@ -746,7 +833,7 @@ def run_backtest(
             include_all_boards=include_all_boards,
             scoring_mode=scoring_mode,
             is_backtest=True,
-            strategy_filter=DEFAULT_STRATEGY_FILTER,
+            strategy_filter=strategy_filter,
         )
         for signal in signals:
             code_str = str(signal["code"])
@@ -757,6 +844,8 @@ def run_backtest(
                 continue
             signal_rows.append({"run_date": review_date, **signal})
             trade = simulate_trade(cache, review_date, signal, max_hold_days=max_hold_days)
+            if trade is None:
+                continue
             trades.append(trade)
             
             # 记录这笔独立交易的下车时间，在它下车前不再买它
@@ -775,7 +864,8 @@ def run_backtest(
 
     effective_start = review_dates[0] if review_dates else start_trade_date or "na"
     effective_end = review_dates[-1] if review_dates else end_trade_date or "na"
-    file_suffix = f"{effective_start.replace('-', '')}_{effective_end.replace('-', '')}"
+    strategy_suffix = strategy_filter or STRATEGY_FILTER_ALL
+    file_suffix = f"{strategy_suffix}_{effective_start.replace('-', '')}_{effective_end.replace('-', '')}"
     portfolio_end_date = max((str(item["exit_date"]) for item in trades), default=effective_end)
     close_lookup = cache.get_close_lookup(set([str(item["code"]) for item in trades]), effective_start, portfolio_end_date)
     portfolio_trading_dates = [d for d in cache.review_dates if effective_start <= d <= portfolio_end_date]
@@ -807,6 +897,7 @@ def run_backtest(
         "start_date": effective_start,
         "end_date": effective_end,
         "scoring_mode": scoring_mode,
+        "strategy_filter": strategy_filter,
         "overall": overall_summary,
         "portfolio": portfolio_summary,
         "with_pullback_shrink_twice": shrink_summary,
@@ -819,11 +910,12 @@ def run_backtest(
         "skipped_trade_count": len(skipped_trades),
     }
     notes = [
-        "买点使用信号当日收盘价，只在尾盘买入。",
+        "趋势建立初期型：信号当日收盘价买入，只在尾盘买入。",
+        "突破加速型：信号出现后需次日收盘确认站上信号日高点，再按次日收盘价买入。",
         "止损使用本金回撤 10%，一旦后续日线最低价触及止损价，按止损价卖出。",
         "出场规则改为趋势止盈/止损：只要后续任一交易日收盘价跌破 MA20，即按当日收盘价离场。",
         f"若股票因跌破 MA20 获利离场，则自卖出日开始 {TAKE_PROFIT_COOLDOWN_DAYS} 天内不再重复买入。",
-        "默认策略：只交易包含‘60日内两次缩量下跌’的信号。",
+        f"本次回测买入策略过滤：{get_strategy_filter_label(strategy_filter)}。",
         "同一只股票在前一笔交易尚未出场前，不会响应新的重复信号。",
         "回测候选直接使用 stocks + daily_bars 还原历史当日样本；成交量过滤保持一致，流通市值过滤仅在 float_mv_yi 可用时生效。",
         "若直到数据末尾仍未触发卖出，则按最后一个可用收盘价平仓。",
@@ -843,6 +935,7 @@ def compare_scoring_modes(
     initial_capital: float = DEFAULT_INITIAL_CAPITAL,
     position_size: float = DEFAULT_POSITION_SIZE,
     max_positions: int = DEFAULT_MAX_POSITIONS,
+    strategy_filter: str = DEFAULT_STRATEGY_FILTER,
 ) -> dict:
     start_trade_date = parse_review_date(start_date)[0] if start_date else None
     end_trade_date = parse_review_date(end_date)[0] if end_date else None
@@ -863,6 +956,7 @@ def compare_scoring_modes(
         position_size=position_size,
         max_positions=max_positions,
         cache=cache,
+        strategy_filter=strategy_filter,
     )
     dedup_summary = run_backtest(
         start_date=start_date,
@@ -876,6 +970,7 @@ def compare_scoring_modes(
         position_size=position_size,
         max_positions=max_positions,
         cache=cache,
+        strategy_filter=strategy_filter,
     )
     compare_summary = {
         "start_date": legacy_summary["start_date"],
@@ -891,6 +986,68 @@ def compare_scoring_modes(
     return compare_summary
 
 
+def compare_strategies(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    top_n: int = 10,
+    limit: int = 0,
+    include_all_boards: bool = False,
+    max_hold_days: int = 0,
+    scoring_mode: str = "dedup",
+    initial_capital: float = DEFAULT_INITIAL_CAPITAL,
+    position_size: float = DEFAULT_POSITION_SIZE,
+    max_positions: int = DEFAULT_MAX_POSITIONS,
+) -> dict:
+    start_trade_date = parse_review_date(start_date)[0] if start_date else None
+    end_trade_date = parse_review_date(end_date)[0] if end_date else None
+
+    conn = get_db_connection()
+    cache = MarketDataCache(conn, start_trade_date, end_trade_date)
+    conn.close()
+
+    trend_init_summary = run_backtest(
+        start_date=start_date,
+        end_date=end_date,
+        top_n=top_n,
+        limit=limit,
+        include_all_boards=include_all_boards,
+        max_hold_days=max_hold_days,
+        scoring_mode=scoring_mode,
+        initial_capital=initial_capital,
+        position_size=position_size,
+        max_positions=max_positions,
+        cache=cache,
+        strategy_filter=STRATEGY_TREND_INIT,
+    )
+    breakout_accel_summary = run_backtest(
+        start_date=start_date,
+        end_date=end_date,
+        top_n=top_n,
+        limit=limit,
+        include_all_boards=include_all_boards,
+        max_hold_days=max_hold_days,
+        scoring_mode=scoring_mode,
+        initial_capital=initial_capital,
+        position_size=position_size,
+        max_positions=max_positions,
+        cache=cache,
+        strategy_filter=STRATEGY_BREAKOUT_ACCEL,
+    )
+    compare_summary = {
+        "start_date": trend_init_summary["start_date"],
+        "end_date": trend_init_summary["end_date"],
+        "scoring_mode": scoring_mode,
+        STRATEGY_TREND_INIT: trend_init_summary,
+        STRATEGY_BREAKOUT_ACCEL: breakout_accel_summary,
+    }
+    compare_path = BACKTEST_DIR / (
+        f"backtest_strategy_compare_{scoring_mode}_{trend_init_summary['start_date'].replace('-', '')}_{trend_init_summary['end_date'].replace('-', '')}.md"
+    )
+    write_strategy_compare_markdown(compare_path, compare_summary)
+    compare_summary["compare_markdown_path"] = str(compare_path)
+    return compare_summary
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="基于历史日线回放选股信号并执行事件回测")
     parser.add_argument("--start-date", type=str, default=None, help="起始日期，格式 YYYYMMDD 或 YYYY-MM-DD")
@@ -901,6 +1058,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-hold-days", type=int, default=0, help="最大持有天数，0 表示直到触发卖点或数据结束")
     parser.add_argument("--scoring-mode", choices=["legacy", "dedup"], default="dedup", help="评分模式")
     parser.add_argument("--compare-modes", action="store_true", help="同时回测 legacy 和 dedup 两种评分模式")
+    parser.add_argument("--strategy-filter", choices=list(STRATEGY_FILTER_CHOICES), default=DEFAULT_STRATEGY_FILTER, help="买入策略过滤：all、trend_init、breakout_accel")
+    parser.add_argument("--compare-strategies", action="store_true", help="同时回测趋势建立初期型与突破加速型")
     parser.add_argument("--initial-capital", type=float, default=DEFAULT_INITIAL_CAPITAL, help="组合回测初始资金")
     parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE, help="单笔固定仓位")
     parser.add_argument("--max-positions", type=int, default=DEFAULT_MAX_POSITIONS, help="最大同时持仓数")
@@ -909,6 +1068,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.compare_strategies:
+        summary = compare_strategies(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            top_n=args.top_n,
+            limit=args.limit,
+            include_all_boards=args.all_boards,
+            max_hold_days=args.max_hold_days,
+            scoring_mode=args.scoring_mode,
+            initial_capital=args.initial_capital,
+            position_size=args.position_size,
+            max_positions=args.max_positions,
+        )
+        print(
+            f"策略对比回测完成: {summary['start_date']} -> {summary['end_date']}, "
+            f"{get_strategy_filter_label(STRATEGY_TREND_INIT)} 组合收益 {summary[STRATEGY_TREND_INIT]['portfolio']['total_return_pct']}%, "
+            f"{get_strategy_filter_label(STRATEGY_BREAKOUT_ACCEL)} 组合收益 {summary[STRATEGY_BREAKOUT_ACCEL]['portfolio']['total_return_pct']}%"
+        )
+        print(f"对比摘要: {summary['compare_markdown_path']}")
+        return
+
     if args.compare_modes:
         summary = compare_scoring_modes(
             start_date=args.start_date,
@@ -920,6 +1100,7 @@ def main() -> None:
             initial_capital=args.initial_capital,
             position_size=args.position_size,
             max_positions=args.max_positions,
+            strategy_filter=args.strategy_filter,
         )
         print(
             f"对比回测完成: {summary['start_date']} -> {summary['end_date']}, "
@@ -940,10 +1121,11 @@ def main() -> None:
         initial_capital=args.initial_capital,
         position_size=args.position_size,
         max_positions=args.max_positions,
+        strategy_filter=args.strategy_filter,
     )
     print(
         f"回测完成: {summary['start_date']} -> {summary['end_date']}, "
-        f"模式 {summary['scoring_mode']}, 交易 {summary['overall']['trade_count']} 笔, "
+        f"模式 {summary['scoring_mode']}, 策略 {get_strategy_filter_label(summary['strategy_filter'])}, 交易 {summary['overall']['trade_count']} 笔, "
         f"组合收益 {summary['portfolio']['total_return_pct']}%"
     )
     print(f"交易明细: {summary['trade_csv_path']}")

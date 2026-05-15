@@ -46,6 +46,17 @@ SPACE_TO_HIGH_WARN_PENALTY = -8
 BREAKOUT_READY_MIN_VOLUME_RATIO = 1.8
 BREAKOUT_READY_MAX_BIAS_RATIO = 0.07
 BREAKOUT_READY_MAX_RSI = 65
+TREND_INIT_MAX_BIAS_RATIO = 0.05
+TREND_INIT_MIN_VOLUME_RATIO = 1.0
+TREND_INIT_MAX_CROSS_AGE = 10
+TREND_INIT_MA20_HOLD_RATIO = 0.995
+
+STRATEGY_TREND_INIT = "trend_init"
+STRATEGY_BREAKOUT_ACCEL = "breakout_accel"
+STRATEGY_LABELS = {
+    STRATEGY_TREND_INIT: "趋势建立初期型",
+    STRATEGY_BREAKOUT_ACCEL: "突破加速型",
+}
 
 MAX_BIAS_RATIO = 0.10
 MAX_RSI = 75
@@ -284,6 +295,48 @@ def build_space_to_high_penalty_components(space_to_high: float, breakout_ready_
     return components
 
 
+def detect_strategy_setups(
+    cross_type: str,
+    cross_age: int | None,
+    shrinking_down_count: int,
+    bias: float,
+    vol_ratio: float,
+    is_up_day: bool,
+    space_to_high: float,
+    breakout_ready_second_cross: bool,
+    close_price: float,
+    ma20_price: float,
+    low_price: float,
+) -> list[str]:
+    strategy_setups: list[str] = []
+
+    holds_ma20 = ma20_price > 0 and close_price >= ma20_price and low_price >= ma20_price * TREND_INIT_MA20_HOLD_RATIO
+    trend_init_ready = (
+        cross_type in ("first", "second")
+        and (cross_age or 0) <= TREND_INIT_MAX_CROSS_AGE
+        and shrinking_down_count >= 1
+        and bias <= TREND_INIT_MAX_BIAS_RATIO
+        and is_up_day
+        and vol_ratio >= TREND_INIT_MIN_VOLUME_RATIO
+        and holds_ma20
+    )
+    if trend_init_ready:
+        strategy_setups.append(STRATEGY_TREND_INIT)
+
+    breakout_accel_ready = (
+        cross_type == "second"
+        and shrinking_down_count >= SHRINKING_DOWN_MIN_COUNT
+        and breakout_ready_second_cross
+        and is_up_day
+        and vol_ratio >= VOLUME_BREAKOUT
+        and space_to_high < SPACE_TO_HIGH_TIGHT_THRESHOLD
+    )
+    if breakout_accel_ready:
+        strategy_setups.append(STRATEGY_BREAKOUT_ACCEL)
+
+    return strategy_setups
+
+
 def analyze_stock(
     code: str,
     name: str,
@@ -335,9 +388,11 @@ def analyze_stock(
     if avg_volume_20 == 0 or math.isnan(avg_volume_20):
         return None
     vol_ratio = volume.iloc[-1] / avg_volume_20
+    latest_open = float(kline["open"].iloc[-1])
+    latest_low = float(kline["low"].iloc[-1])
     is_up_day = (
         len(close) >= 2
-        and float(kline["close"].iloc[-1]) > float(kline["open"].iloc[-1])
+        and float(kline["close"].iloc[-1]) > latest_open
         and close.iloc[-1] > close.iloc[-2]
     )
     bias = (close.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]
@@ -453,6 +508,26 @@ def analyze_stock(
     if scoring_mode == "dedup" and selected_score < DEDUP_MIN_SIGNAL_SCORE:
         return None
 
+    strategy_setups = detect_strategy_setups(
+        cross_type=cross_type,
+        cross_age=cross_age,
+        shrinking_down_count=shrinking_down_count,
+        bias=float(bias),
+        vol_ratio=float(vol_ratio),
+        is_up_day=is_up_day,
+        space_to_high=float(space_to_high),
+        breakout_ready_second_cross=breakout_ready_second_cross,
+        close_price=float(close.iloc[-1]),
+        ma20_price=float(ma20.iloc[-1]),
+        low_price=latest_low,
+    )
+    if not strategy_setups:
+        return None
+
+    primary_strategy = (
+        STRATEGY_BREAKOUT_ACCEL if STRATEGY_BREAKOUT_ACCEL in strategy_setups else strategy_setups[0]
+    )
+
     return {
         "code": code,
         "name": name,
@@ -480,4 +555,8 @@ def analyze_stock(
             "dedup": dedup_group_scores,
         },
         "liquidity_ratio_pct": round(float(liquidity_ratio_pct), 2) if liquidity_ratio_pct is not None else None,
+        "strategy_setups": strategy_setups,
+        "strategy_labels": [STRATEGY_LABELS[item] for item in strategy_setups],
+        "primary_strategy": primary_strategy,
+        "primary_strategy_label": STRATEGY_LABELS[primary_strategy],
     }
