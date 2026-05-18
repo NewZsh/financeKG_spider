@@ -195,7 +195,8 @@ def to_symbol(code: str) -> str:
 
 
 def get_all_stock_codes() -> pd.DataFrame:
-    return load_sync_api().get_all_stock_codes()
+    sync_api = load_sync_api()
+    return sync_api.MarketDataFetcher.get_all_stock_codes()
 
 
 def load_indicator_api():
@@ -220,11 +221,13 @@ def load_indicator_module():
 
 
 def fetch_tencent_realtime(codes: list[str]) -> dict[str, dict]:
-    return load_sync_api().fetch_tencent_realtime(codes)
+    sync_api = load_sync_api()
+    return sync_api.MarketDataFetcher.fetch_tencent_realtime(codes)
 
 
 def fetch_daily_bars(code: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
-    return load_sync_api().fetch_daily_bars(code, start_date=start_date, end_date=end_date, adjust=adjust)
+    sync_api = load_sync_api()
+    return sync_api.MarketDataFetcher.fetch_daily_bars(code, start_date=start_date, end_date=end_date, adjust=adjust)
 
 
 def upsert_stocks(conn: sqlite3.Connection, stocks_df: pd.DataFrame) -> int:
@@ -249,11 +252,15 @@ def upsert_stocks(conn: sqlite3.Connection, stocks_df: pd.DataFrame) -> int:
 
 
 def upsert_daily_bars(conn: sqlite3.Connection, code: str, adjust_type: str, bars_df: pd.DataFrame) -> int:
-    return load_sync_api().upsert_daily_bars(conn, code, adjust_type, bars_df)
+    sync_api = load_sync_api()
+    engine = sync_api.StockMarketSyncEngine(limit=0, request_pause=0)
+    return engine._upsert_daily_bars(conn, code, adjust_type, bars_df)
 
 
 def replace_qfq_history(conn: sqlite3.Connection, code: str, bars_df: pd.DataFrame) -> int:
-    return load_sync_api().replace_qfq_history(conn, code, bars_df)
+    sync_api = load_sync_api()
+    engine = sync_api.StockMarketSyncEngine(limit=0, request_pause=0)
+    return engine._replace_qfq_history(conn, code, bars_df)
 
 
 def select_sync_candidates(stocks_df: pd.DataFrame, realtime: dict[str, dict]) -> list[dict]:
@@ -562,7 +569,12 @@ def store_indicator_snapshots(conn: sqlite3.Connection, review_date: str, result
         )
 
 
-def run_compute(review_date: str | None = None, limit: int = 0, include_all_boards: bool = False) -> dict:
+def run_compute(
+    review_date: str | None = None,
+    limit: int = 0,
+    include_all_boards: bool = False,
+    scoring_mode: str = "dedup",
+) -> dict:
     lookback_days, analyze_stock = load_indicator_module()
     trade_date, _ = parse_review_date(review_date)
     conn = get_db_connection()
@@ -586,6 +598,7 @@ def run_compute(review_date: str | None = None, limit: int = 0, include_all_boar
             row["code"],
             row["name"],
             kline,
+            scoring_mode=scoring_mode,
             float_mv_yi=float_mv_yi,
             liquidity_ratio_pct=liquidity_ratio_pct,
         )
@@ -609,6 +622,7 @@ def run_compute(review_date: str | None = None, limit: int = 0, include_all_boar
 
     return {
         "review_date": trade_date,
+        "scoring_mode": scoring_mode,
         "candidate_count": len(candidates),
         "analyzed_count": analyzed_count,
         "missing_kline_count": missing_kline,
@@ -771,9 +785,10 @@ def get_review_run_record(review_date: str) -> dict | None:
 
 def ensure_review_market_data_ready(review_date: str) -> dict:
     sync_api = load_sync_api()
+    reader = sync_api.StockMarketDataReader
     trade_date, compact_date = parse_review_date(review_date)
-    status = sync_api.has_market_data_for_date(trade_date)
-    status["is_trade_day"] = sync_api.is_trade_day(trade_date)
+    status = reader.has_market_data_for_date(trade_date)
+    status["is_trade_day"] = reader.is_trade_day(trade_date)
     status["suggested_command"] = f"python -m stock.sync_market_data --start-date {trade_date} --end-date {trade_date}"
     if not status["is_trade_day"]:
         status["is_ready_for_review"] = True
@@ -828,6 +843,7 @@ def write_review_markdown(
     writer.append(f"- 开始时间: {started_at}")
     writer.append(f"- 结束时间: {finished_at}")
     writer.append(f"- SQLite: {sync_summary['db_path']}")
+    writer.append(f"- 评分模式: {compute_summary.get('scoring_mode', 'dedup')}")
     writer.append()
 
     writer.heading("执行过程")
@@ -910,6 +926,7 @@ def run_daily_review(
     include_all_boards: bool = False,
     skip_sync: bool = False,
     recent_days: int = 45,
+    scoring_mode: str = "dedup",
 ) -> dict:
     """
     复盘主流程：
@@ -925,10 +942,12 @@ def run_daily_review(
 - include_all_boards: 是否包含创业板、科创板等全部板块，默认为 False（仅主板）
 - skip_sync: 是否跳过当日同步完整性检查，直接使用 SQLite 现有数据，默认为 False
 - recent_days: 保留兼容参数，不再触发实际行情同步，默认为 45
+- scoring_mode: 评分模式，支持 legacy 和 dedup，默认为 dedup
     """
     trade_date, compact_date = parse_review_date(review_date)
-    markdown_path = REVIEW_DIR / f"review{compact_date}.md"
-    csv_path = REVIEW_DIR / f"review{compact_date}.csv"
+    file_suffix = "" if scoring_mode == "dedup" else f"_{scoring_mode}"
+    markdown_path = REVIEW_DIR / f"review{compact_date}{file_suffix}.md"
+    csv_path = REVIEW_DIR / f"review{compact_date}{file_suffix}.csv"
     writer = ReviewWriter(markdown_path)
     started_at = now_ts()
 
@@ -961,8 +980,13 @@ def run_daily_review(
             sync_summary["check_message"] = f"{trade_date} 手动跳过当日同步校验，直接读取现有 SQLite。"
             print(f"[1/3] {sync_summary['check_message']}")
 
-        print(f"[2/3] 计算技术指标: {trade_date}")
-        compute_summary = run_compute(review_date=trade_date, limit=limit, include_all_boards=include_all_boards)
+        print(f"[2/3] 计算技术指标: {trade_date} [{scoring_mode}]")
+        compute_summary = run_compute(
+            review_date=trade_date,
+            limit=limit,
+            include_all_boards=include_all_boards,
+            scoring_mode=scoring_mode,
+        )
 
         csv_rows = to_csv_rows(compute_summary["results"])
         pd.DataFrame(csv_rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -984,7 +1008,7 @@ def run_daily_review(
         print(f"[3/3] 输出完成: {markdown_path.name}, {csv_path.name}")
         print(
             f"复盘完成: 候选 {compute_summary['candidate_count']} 只, 已分析 {compute_summary['analyzed_count']} 只, "
-            f"信号 {compute_summary['signal_count']} 只"
+            f"信号 {compute_summary['signal_count']} 只, 模式 {scoring_mode}"
         )
         return {
             "review_date": trade_date,
@@ -1016,6 +1040,7 @@ def run_daily_review_on_startup(
     limit: int = 0,
     include_all_boards: bool = False,
     recent_days: int = 45,
+    scoring_mode: str = "dedup",
 ) -> dict | None:
     should_run, review_date, message = evaluate_auto_run()
     print(message)
@@ -1029,11 +1054,17 @@ def run_daily_review_on_startup(
         include_all_boards=include_all_boards,
         skip_sync=False,
         recent_days=recent_days,
+        scoring_mode=scoring_mode,
     )
 
 
 def build_sync_arg_parser() -> argparse.ArgumentParser:
-    return load_sync_api().build_sync_arg_parser()
+    parser = argparse.ArgumentParser(description="同步 A 股行情到 SQLite")
+    parser.add_argument("--start-date", type=str, default=None, help="起始同步日期。格式 YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, default=None, help="结束同步日期。格式 YYYY-MM-DD")
+    parser.add_argument("--limit", type=int, default=0, help="仅同步前 N 只股票，便于调试")
+    parser.add_argument("--plot", type=str, default=None, help="输入股票代码（如 000001），直接拉取库中数据并展示K线图（不会进行同步操作）")
+    return parser
 
 
 def main_sync_market_data() -> None:
@@ -1048,6 +1079,7 @@ def build_daily_review_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all-boards", action="store_true", help="包含创业板、科创板等全部板块")
     parser.add_argument("--skip-sync", action="store_true", help="跳过当日同步完整性检查，直接使用 SQLite 现有数据")
     parser.add_argument("--recent-days", type=int, default=45, help="保留兼容参数，不再触发实际行情同步")
+    parser.add_argument("--scoring-mode", choices=["legacy", "dedup"], default="dedup", help="评分模式")
     parser.add_argument("--force-run", action="store_true", help="忽略启动时间和当日运行记录，直接执行今日复盘")
     return parser
 
@@ -1060,6 +1092,7 @@ def main_daily_review() -> None:
             limit=args.limit,
             include_all_boards=args.all_boards,
             recent_days=args.recent_days,
+            scoring_mode=args.scoring_mode,
         )
         return
 
@@ -1070,6 +1103,7 @@ def main_daily_review() -> None:
         include_all_boards=args.all_boards,
         skip_sync=args.skip_sync,
         recent_days=args.recent_days,
+        scoring_mode=args.scoring_mode,
     )
 
 if __name__ == "__main__":
