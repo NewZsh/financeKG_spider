@@ -51,7 +51,7 @@ from requests.adapters import HTTPAdapter
 
 # 进程内前端载荷缓存的有效期。
 PAYLOAD_CACHE_TTL_SECONDS = 10 * 60
-FULL_REFRESH_START = "2020-01-01"  # 从历史上改日开始拉取数据，建立前复权日线
+FULL_REFRESH_START = "2010-01-01"  # 从历史上该日开始拉取数据，建立前复权日线
 # 腾讯快照接口支持批量代码，单次请求尽量按批处理，避免过细碎请求。
 TENCENT_BATCH_SIZE = 50
 # 读取时保留最近多少个交易日的分时和价格分布数据。
