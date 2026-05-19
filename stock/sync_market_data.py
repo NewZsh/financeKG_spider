@@ -113,6 +113,8 @@ def is_st(name: str) -> bool:
 
 
 def to_symbol(code: str) -> str:
+    if code.startswith(("8", "4", "9")):
+        return f"bj{code}"
     return f"sh{code}" if code.startswith(("6", "688")) else f"sz{code}"
 
 
@@ -622,6 +624,7 @@ class MarketDataFetcher:
             return fill_daily_amount(cached.copy())
             
         symbol = to_symbol(code)
+        is_bj_symbol = symbol.startswith("bj")
         adjust_type = "qfq" if adjust == "qfq" else ""
         limit = 640
         all_data = []
@@ -629,7 +632,9 @@ class MarketDataFetcher:
         
         while True:
             ApiRateLimiter.wait("daily_bars")
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayqfq&param={symbol},day,{start_date},{current_end},{limit},{adjust_type}"
+            request_start = "" if is_bj_symbol else start_date
+            request_end = "" if is_bj_symbol else current_end
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayqfq&param={symbol},day,{request_start},{request_end},{limit},{adjust_type}"
             def do_fetch():
                 resp = SharedHttpClient.get(url, timeout=15)
                 if resp.status_code != 200:
@@ -648,6 +653,10 @@ class MarketDataFetcher:
                 break
                 
             if not days:
+                break
+
+            if is_bj_symbol:
+                all_data = list(days)
                 break
                 
             all_data.extend(reversed(days))  # Collect in reverse to keep track
@@ -686,6 +695,10 @@ class MarketDataFetcher:
         df = pd.DataFrame(records)
         df = fill_daily_amount(df)
         normalized = MarketDataFetcher._normalize_daily_bars_df(df)
+        if is_bj_symbol and not normalized.empty:
+            normalized = normalized[
+                (normalized["date"] >= start_date) & (normalized["date"] <= end_date)
+            ].copy()
         if not normalized.empty:
             save_pickle_cache(cache_path, normalized)
         return normalized
