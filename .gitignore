@@ -6,7 +6,7 @@ data/*
 !data/schema/
 !/data/schema/stock.sql
 
-!stock/doc/stock_email.config
+stock/doc/stock_email.config
 
 # Exclude .venv and virtual environment directories
 .venv/
