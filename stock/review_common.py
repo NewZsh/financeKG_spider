@@ -7,6 +7,7 @@
     --limit: 仅分析前 N 只候选股（用于调试），默认为 0（不限制）
     --all-boards: 包含创业板、科创板等全部板块，默认为只看主板
     --skip-sync: 跳过当日同步完整性检查，直接使用 SQLite 现有数据
+    --skip-email: 仅生成 Markdown 和 CSV，不发送邮件
     --force-run: 忽略启动时间和当日运行记录，强制执行复盘
 
 用法：
@@ -24,9 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import smtplib
 import sqlite3
 import traceback
 from datetime import datetime, time as dt_time
+from email import encoders
+from email.header import Header
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 from pathlib import Path
 
 import pandas as pd
@@ -113,6 +121,27 @@ SCHEMA_MIGRATIONS = {
 
 MIN_LIQUIDITY_RATIO_PCT = 2.0
 
+EMAIL_CONFIG_PATH = REVIEW_DIR / "doc" / "stock_email.config"
+
+
+def load_email_config() -> tuple[str, str, list[str], str]:
+    if not EMAIL_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"邮件配置文件不存在: {EMAIL_CONFIG_PATH}")
+
+    namespace: dict[str, object] = {}
+    exec(EMAIL_CONFIG_PATH.read_text(encoding="utf-8"), {}, namespace)
+
+    token = str(namespace["QQMAIL_TOKEN"])
+    from_addr = str(namespace["EMAIL_FROM_ADDR"])
+    to_addrs = namespace["EMAIL_TO_ADDRS"]
+    from_name = str(namespace.get("EMAIL_FROM_NAME", "Sam"))
+    if not isinstance(to_addrs, list) or not all(isinstance(item, str) for item in to_addrs):
+        raise ValueError("EMAIL_TO_ADDRS 必须是字符串列表")
+    return token, from_addr, to_addrs, from_name
+
+
+QQMAIL_TOKEN, EMAIL_FROM_ADDR, EMAIL_TO_ADDRS, EMAIL_FROM_NAME = load_email_config()
+
 
 def get_db_connection() -> sqlite3.Connection:
     ensure_runtime_paths()
@@ -126,6 +155,40 @@ def get_db_connection() -> sqlite3.Connection:
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_email_addr(value: str) -> str:
+    name, addr = parseaddr(value)
+    display_name = name or EMAIL_FROM_NAME
+    return formataddr((Header(display_name, "utf-8").encode(), addr))
+
+
+def send_review_email(subject: str, body: str, attachments: list[Path]) -> None:
+    message = MIMEMultipart()
+    message["From"] = format_email_addr(f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDR}>")
+    message["To"] = ", ".join(EMAIL_TO_ADDRS)
+    message["Subject"] = Header(subject, "utf-8")
+    message.attach(MIMEText(body, "plain", "utf-8"))
+
+    for attachment_path in attachments:
+        if not attachment_path.exists():
+            raise FileNotFoundError(f"附件不存在: {attachment_path}")
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(attachment_path.read_bytes())
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=("utf-8", "", attachment_path.name),
+        )
+        message.attach(part)
+
+    smtp = smtplib.SMTP_SSL("smtp.qq.com", 465)
+    try:
+        smtp.login(EMAIL_FROM_ADDR, QQMAIL_TOKEN)
+        smtp.sendmail(EMAIL_FROM_ADDR, EMAIL_TO_ADDRS, message.as_string())
+    finally:
+        smtp.quit()
 
 
 def normalize_trade_date(value: object) -> str:
@@ -925,6 +988,7 @@ def run_daily_review(
     limit: int = 0,
     include_all_boards: bool = False,
     skip_sync: bool = False,
+    send_email: bool = True,
     recent_days: int = 45,
     scoring_mode: str = "dedup",
 ) -> dict:
@@ -941,6 +1005,7 @@ def run_daily_review(
 - limit: 仅分析前 N 只候选股，默认为 0（不限制）
 - include_all_boards: 是否包含创业板、科创板等全部板块，默认为 False（仅主板）
 - skip_sync: 是否跳过当日同步完整性检查，直接使用 SQLite 现有数据，默认为 False
+- send_email: 是否在报告生成后发送邮件，默认为 True
 - recent_days: 保留兼容参数，不再触发实际行情同步，默认为 45
 - scoring_mode: 评分模式，支持 legacy 和 dedup，默认为 dedup
     """
@@ -1005,6 +1070,24 @@ def run_daily_review(
             compute_summary=compute_summary,
         )
 
+        if send_email:
+            email_subject = f"股票复盘报告 {compact_date} [{scoring_mode}]"
+            email_body = (
+                f"复盘日期: {trade_date}\n"
+                f"评分模式: {scoring_mode}\n"
+                f"候选数量: {compute_summary['candidate_count']}\n"
+                f"已分析数量: {compute_summary['analyzed_count']}\n"
+                f"信号数量: {compute_summary['signal_count']}\n\n"
+                "附件包含本次生成的 Markdown 和 CSV 报告。"
+            )
+            try:
+                send_review_email(email_subject, email_body, [markdown_path, csv_path])
+                print(f"[3/3] 邮件发送完成: {', '.join(EMAIL_TO_ADDRS)}")
+            except Exception as email_exc:
+                print(f"[3/3] 邮件发送失败: {email_exc}")
+        else:
+            print("[3/3] 已跳过邮件发送")
+
         print(f"[3/3] 输出完成: {markdown_path.name}, {csv_path.name}")
         print(
             f"复盘完成: 候选 {compute_summary['candidate_count']} 只, 已分析 {compute_summary['analyzed_count']} 只, "
@@ -1040,6 +1123,7 @@ def run_daily_review_on_startup(
     limit: int = 0,
     include_all_boards: bool = False,
     recent_days: int = 45,
+    send_email: bool = True,
     scoring_mode: str = "dedup",
 ) -> dict | None:
     should_run, review_date, message = evaluate_auto_run()
@@ -1054,6 +1138,7 @@ def run_daily_review_on_startup(
         include_all_boards=include_all_boards,
         skip_sync=False,
         recent_days=recent_days,
+        send_email=send_email,
         scoring_mode=scoring_mode,
     )
 
@@ -1078,6 +1163,7 @@ def build_daily_review_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0, help="仅分析前 N 只候选股")
     parser.add_argument("--all-boards", action="store_true", help="包含创业板、科创板等全部板块")
     parser.add_argument("--skip-sync", action="store_true", help="跳过当日同步完整性检查，直接使用 SQLite 现有数据")
+    parser.add_argument("--skip-email", action="store_true", help="仅生成 Markdown 和 CSV，不发送邮件")
     parser.add_argument("--recent-days", type=int, default=45, help="保留兼容参数，不再触发实际行情同步")
     parser.add_argument("--scoring-mode", choices=["legacy", "dedup"], default="dedup", help="评分模式")
     parser.add_argument("--force-run", action="store_true", help="忽略启动时间和当日运行记录，直接执行今日复盘")
@@ -1092,6 +1178,7 @@ def main_daily_review() -> None:
             limit=args.limit,
             include_all_boards=args.all_boards,
             recent_days=args.recent_days,
+            send_email=not args.skip_email,
             scoring_mode=args.scoring_mode,
         )
         return
@@ -1103,6 +1190,7 @@ def main_daily_review() -> None:
         include_all_boards=args.all_boards,
         skip_sync=args.skip_sync,
         recent_days=args.recent_days,
+        send_email=not args.skip_email,
         scoring_mode=args.scoring_mode,
     )
 
