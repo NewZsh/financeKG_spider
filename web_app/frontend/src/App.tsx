@@ -1,5 +1,6 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
+import ErrorBoundary from './components/ErrorBoundary';
 import Home from './pages/Home';
 import TYCKeywords from './pages/TYCKeywords';
 import TYcStats from './pages/TYCStats';
@@ -11,14 +12,16 @@ export default function App(){
   return (
     <BrowserRouter>
       <div style={{padding:20}}>
-        <Routes>
-          <Route path='/' element={<Home/>} />
-          <Route path='/config' element={<Config/>} />
-          <Route path='/tyc/keywords' element={<TYCKeywords/>} />
-          <Route path='/tyc/stats' element={<TYcStats/>} />
-          <Route path='/graph' element={<GraphView/>} />
-          <Route path='/stock-graph' element={<StockGraphView/>} />
-        </Routes>
+        <ErrorBoundary>
+          <Routes>
+            <Route path='/' element={<Home/>} />
+            <Route path='/config' element={<Config/>} />
+            <Route path='/tyc/keywords' element={<TYCKeywords/>} />
+            <Route path='/tyc/stats' element={<TYcStats/>} />
+            <Route path='/graph' element={<GraphView/>} />
+            <Route path='/stock-graph' element={<StockGraphView/>} />
+          </Routes>
+        </ErrorBoundary>
       </div>
     </BrowserRouter>
   )

@@ -653,56 +653,88 @@ const StockGraphView = () => {
     const container = containerRef.current;
     const height = 620;
     const width = container.clientWidth || container.offsetWidth || 800;
-    const graph = new Graph({
-      container,
-      data: graphData,
-      width,
-      height,
-      autoFit: 'view',
-      padding: 32,
-      zoomRange: [0.2, 4],
-      layout: {
-        type: 'force',
-        preventOverlap: true,
-        linkDistance: 150,
-        nodeSize: 48,
-      },
-      behaviors: ['drag-canvas', 'zoom-canvas', 'drag-element'],
-      node: {
-        type: 'circle',
-        style: {
-          size: 48,
-          fill: '#C6E5FF',
-          stroke: '#5B8FF9',
-          lineWidth: 2,
-          label: true,
-          labelPlacement: 'bottom',
-          labelFill: '#1F2D3D',
-          labelFontSize: 12,
-          labelMaxWidth: 180,
-          labelWordWrap: true,
-          labelOffsetY: 10,
+    const nodeCount = graphData.nodes.length;
+    const edgeCount = graphData.edges.length;
+    const isLargeGraph = nodeCount > 300;
+
+    // 节点多时关闭标签，减少渲染开销
+    const showNodeLabel = nodeCount <= 300;
+    const showEdgeLabel = edgeCount <= 400;
+
+    // 根据数据量调整布局参数，节点越多迭代越少，保证及时出图
+    const forceIterations = nodeCount <= 200 ? 300
+      : nodeCount <= 500 ? 150
+      : nodeCount <= 1000 ? 80
+      : 40;
+    const forceAlphaDecay = nodeCount <= 200 ? 0.01
+      : nodeCount <= 500 ? 0.03
+      : nodeCount <= 1000 ? 0.06
+      : 0.12;
+
+    let graph: Graph;
+    try {
+      graph = new Graph({
+        container,
+        data: graphData,
+        width,
+        height,
+        autoFit: 'view',
+        padding: 32,
+        zoomRange: [0.2, 4],
+        animation: !isLargeGraph,
+        layout: {
+          type: 'force',
+          preventOverlap: true,
+          linkDistance: isLargeGraph ? 100 : 150,
+          nodeSize: isLargeGraph ? 32 : 48,
+          iterations: forceIterations,
+          alphaDecay: forceAlphaDecay,
+          animate: !isLargeGraph,
         },
-      },
-      edge: {
-        type: 'line',
-        style: {
-          stroke: '#AAB7C4',
-          lineWidth: 1.3,
-          endArrow: true,
-          label: true,
-          labelFontSize: 10,
-          labelFill: '#5D6B7A',
-          labelBackground: true,
-          labelBackgroundFill: 'rgba(255, 255, 255, 0.88)',
-          labelPadding: [2, 4, 2, 4],
-          labelAutoRotate: true,
+        behaviors: ['drag-canvas', 'zoom-canvas', 'drag-element'],
+        node: {
+          type: 'circle',
+          style: {
+            size: isLargeGraph ? 32 : 48,
+            fill: '#C6E5FF',
+            stroke: '#5B8FF9',
+            lineWidth: isLargeGraph ? 1.2 : 2,
+            label: showNodeLabel,
+            labelPlacement: 'bottom',
+            labelFill: '#1F2D3D',
+            labelFontSize: 12,
+            labelMaxWidth: 180,
+            labelWordWrap: true,
+            labelOffsetY: 10,
+          },
         },
-      },
-    });
+        edge: {
+          type: 'line',
+          style: {
+            stroke: '#AAB7C4',
+            lineWidth: isLargeGraph ? 0.8 : 1.3,
+            endArrow: !isLargeGraph,
+            label: showEdgeLabel,
+            labelFontSize: 10,
+            labelFill: '#5D6B7A',
+            labelBackground: true,
+            labelBackgroundFill: 'rgba(255, 255, 255, 0.88)',
+            labelPadding: [2, 4, 2, 4],
+            labelAutoRotate: true,
+          },
+        },
+      });
+    } catch (err) {
+      console.error('Error creating graph:', err);
+      setStatus('error');
+      setMessage('图谱初始化失败');
+      return;
+    }
 
     graphRef.current = graph;
-    void graph.render().catch((error) => {
+    void graph.render().then(() => {
+      // render succeeded
+    }).catch((error) => {
       console.error('Error rendering graph:', error);
       if (graphRef.current === graph) {
         graphRef.current = null;
@@ -756,7 +788,8 @@ const StockGraphView = () => {
     };
   }, [graphData, status]);
 
-  const latestDaily = detail?.market.daily_series[detail.market.daily_series.length - 1] || null;
+  const dailySeries = detail?.market?.daily_series;
+  const latestDaily = dailySeries?.[dailySeries.length - 1] ?? null;
   const distributions = detail?.market.daily_distributions || [];
   const selectedDistribution = distributions.find((item) => item.date === selectedTradeDate) || distributions[distributions.length - 1] || null;
   const badgeClass = status === 'loading'
@@ -876,11 +909,11 @@ const StockGraphView = () => {
               ))}
             </div>
             <div className={styles.distributionSummary}>
-              <div className={styles.summaryChip}>开盘 {formatNumber(selectedDistribution?.summary.open)}</div>
-              <div className={styles.summaryChip}>收盘 {formatNumber(selectedDistribution?.summary.close)}</div>
-              <div className={styles.summaryChip}>高点 {formatNumber(selectedDistribution?.summary.high)}</div>
-              <div className={styles.summaryChip}>低点 {formatNumber(selectedDistribution?.summary.low)}</div>
-              <div className={styles.summaryChip}>总量 {formatLargeNumber(selectedDistribution?.summary.total_volume)}</div>
+              <div className={styles.summaryChip}>开盘 {formatNumber(selectedDistribution?.summary?.open)}</div>
+              <div className={styles.summaryChip}>收盘 {formatNumber(selectedDistribution?.summary?.close)}</div>
+              <div className={styles.summaryChip}>高点 {formatNumber(selectedDistribution?.summary?.high)}</div>
+              <div className={styles.summaryChip}>低点 {formatNumber(selectedDistribution?.summary?.low)}</div>
+              <div className={styles.summaryChip}>总量 {formatLargeNumber(selectedDistribution?.summary?.total_volume)}</div>
             </div>
             <div className={styles.distributionGrid}>
               <div className={styles.distributionCard}>
@@ -910,7 +943,10 @@ const StockGraphView = () => {
             <span className={styles.sectionEyebrow}>Graph</span>
             <h2 className={styles.sectionTitle}>公司关系图谱</h2>
           </div>
-          <p className={styles.sectionDesc}>延续现有二跳图谱能力，双击节点可继续扩展该节点的二跳关系。</p>
+          <p className={styles.sectionDesc}>
+            二跳关系图谱（{graphData?.nodes.length ?? 0} 节点 / {graphData?.edges.length ?? 0} 边）
+            {graphData && graphData.nodes.length > 300 && ' — 节点较多，已关闭标签以提升性能，滚轮放大可查看细节'}
+          </p>
         </div>
         <div className={styles.graphShell}>
           {status === 'ready' ? (

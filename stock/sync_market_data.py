@@ -1348,7 +1348,36 @@ class StockMarketDataReader:
             (code, lookback_days),
         ).fetchall()
         rows = sorted(rows, key=lambda row: str(row["trade_date"]))[-lookback_days:]
-        return [{"date": str(r["trade_date"]), "buy_sell_bins": json.loads(r["buy_sell_bins_json"]), "price_histogram": json.loads(r["price_histogram_json"])} for r in rows]
+
+        if not rows:
+            return []
+
+        dates = [str(r["trade_date"]) for r in rows]
+        placeholders = ",".join("?" * len(dates))
+        daily_rows = conn.execute(
+            f"SELECT trade_date, open, close, high, low, volume FROM daily_bars WHERE code = ? AND trade_date IN ({placeholders})",
+            [code, *dates],
+        ).fetchall()
+        daily_map = {str(r["trade_date"]): r for r in daily_rows}
+
+        result = []
+        for r in rows:
+            trade_date = str(r["trade_date"])
+            daily = daily_map.get(trade_date)
+            result.append({
+                "date": trade_date,
+                "summary": {
+                    "open": safe_float(daily["open"]) if daily else None,
+                    "close": safe_float(daily["close"]) if daily else None,
+                    "high": safe_float(daily["high"]) if daily else None,
+                    "low": safe_float(daily["low"]) if daily else None,
+                    "total_volume": safe_float(daily["volume"]) if daily else None,
+                    "total_amount": safe_float(daily["volume"]) if daily else None,
+                },
+                "buy_sell_bins": json.loads(r["buy_sell_bins_json"]),
+                "price_histogram": json.loads(r["price_histogram_json"]),
+            })
+        return result
 
     @staticmethod
     def plot_kline(code: str, limit: int = 120) -> None:
