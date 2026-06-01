@@ -27,6 +27,7 @@ import argparse
 import json
 import smtplib
 import sqlite3
+import time
 import traceback
 from datetime import datetime, time as dt_time
 from email import encoders
@@ -120,8 +121,11 @@ SCHEMA_MIGRATIONS = {
 }
 
 MIN_LIQUIDITY_RATIO_PCT = 2.0
+SQLITE_BUSY_TIMEOUT_MS = 10000
+SQLITE_LOCK_RETRY_COUNT = 3
+SQLITE_LOCK_RETRY_DELAY_SECONDS = 1.0
 
-EMAIL_CONFIG_PATH = REVIEW_DIR / "doc" / "stock_email.config"
+EMAIL_CONFIG_PATH = BASE_DIR / "stock" / "doc" / "stock_email.config"
 
 
 def load_email_config() -> tuple[str, str, list[str], str]:
@@ -145,8 +149,9 @@ QQMAIL_TOKEN, EMAIL_FROM_ADDR, EMAIL_TO_ADDRS, EMAIL_FROM_NAME = load_email_conf
 
 def get_db_connection() -> sqlite3.Connection:
     ensure_runtime_paths()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
     conn.executescript(schema_sql)
     ensure_schema_migrations(conn)
@@ -224,6 +229,28 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
                 continue
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
     conn.commit()
+
+
+def is_locked_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
+
+
+def run_with_sqlite_lock_retry(action_name: str, func):
+    last_error: Exception | None = None
+    for attempt in range(1, SQLITE_LOCK_RETRY_COUNT + 1):
+        try:
+            return func()
+        except Exception as exc:
+            if not is_locked_error(exc) or attempt == SQLITE_LOCK_RETRY_COUNT:
+                raise
+            last_error = exc
+            print(
+                f"[DB] {action_name} 遇到数据库锁，{attempt}/{SQLITE_LOCK_RETRY_COUNT} 次重试后继续等待 {SQLITE_LOCK_RETRY_DELAY_SECONDS:.1f} 秒..."
+            )
+            time.sleep(SQLITE_LOCK_RETRY_DELAY_SECONDS)
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def calc_liquidity_ratio_pct(amount_wan: object, float_mv_yi: object) -> float | None:
@@ -599,37 +626,46 @@ def load_qfq_bars(conn: sqlite3.Connection, code: str, required_rows: int) -> pd
 
 
 def store_indicator_snapshots(conn: sqlite3.Connection, review_date: str, results: list[dict]) -> None:
-    with conn:
-        conn.execute("DELETE FROM indicator_snapshots WHERE run_date = ?", (review_date,))
-        conn.executemany(
-            """
-            INSERT INTO indicator_snapshots(
-                run_date, code, score, cross_type, cross_type_cn,
-                vol_ratio, angle, rsi, bias, space_to_high, ma5, ma20, bullish_alignment,
-                signals, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    review_date,
-                    item["code"],
-                    item["score"],
-                    item["cross_type"],
-                    item["cross_type_cn"],
-                    item["vol_ratio"],
-                    item["angle"],
-                    item["rsi"],
-                    item["bias"],
-                    item["space_to_high"],
-                    item["ma5"],
-                    item["ma20"],
-                    int(bool(item["bullish_alignment"])),
-                    serialize_signals(item["signals"]),
-                    now_ts(),
-                )
-                for item in results
-            ],
-        )
+    def _write() -> None:
+        with conn:
+            conn.execute("DELETE FROM indicator_snapshots WHERE run_date = ?", (review_date,))
+            conn.executemany(
+                """
+                INSERT INTO indicator_snapshots(
+                    run_date, code, score, cross_type, cross_type_cn,
+                    vol_ratio, angle, rsi, bias, space_to_high, ma5, ma20, bullish_alignment,
+                    signals, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        review_date,
+                        item["code"],
+                        item["score"],
+                        item["cross_type"],
+                        item["cross_type_cn"],
+                        item["vol_ratio"],
+                        item["angle"],
+                        item["rsi"],
+                        item["bias"],
+                        item["space_to_high"],
+                        item["ma5"],
+                        item["ma20"],
+                        int(bool(item["bullish_alignment"])),
+                        serialize_signals(item["signals"]),
+                        now_ts(),
+                    )
+                    for item in results
+                ],
+            )
+
+    try:
+        run_with_sqlite_lock_retry("写入 indicator_snapshots", _write)
+    except Exception as exc:
+        if not is_locked_error(exc):
+            raise
+        conn.rollback()
+        print("[DB] indicator_snapshots 持续被锁定，已跳过本次快照写入")
 
 
 def run_compute(
@@ -641,57 +677,62 @@ def run_compute(
     lookback_days, analyze_stock = load_indicator_module()
     trade_date, _ = parse_review_date(review_date)
     conn = get_db_connection()
-    candidates = load_candidates(conn, trade_date, include_all_boards)
-    if limit > 0:
-        candidates = candidates[:limit]
+    try:
+        candidates = load_candidates(conn, trade_date, include_all_boards)
+        if limit > 0:
+            candidates = candidates[:limit]
 
-    results: list[dict] = []
-    analyzed_count = 0
-    missing_kline = 0
+        results: list[dict] = []
+        analyzed_count = 0
+        missing_kline = 0
 
-    for row in candidates:
-        kline = load_qfq_bars(conn, row["code"], required_rows=lookback_days + 80)
-        if kline.empty or len(kline) < lookback_days // 2:
-            missing_kline += 1
-            continue
-        analyzed_count += 1
-        float_mv_yi = row["float_mv_yi"] if "float_mv_yi" in row.keys() else None
-        liquidity_ratio_pct = row["liquidity_ratio_pct"] if "liquidity_ratio_pct" in row.keys() else None
-        result = analyze_stock(
-            row["code"],
-            row["name"],
-            kline,
-            scoring_mode=scoring_mode,
-            float_mv_yi=float_mv_yi,
-            liquidity_ratio_pct=liquidity_ratio_pct,
-        )
-        if result is None:
-            continue
-        result["board"] = row["board"]
-        result["close"] = round(float(row["close"]), 2) if row["close"] is not None else result["close"]
-        result["open"] = round(float(row["open"]), 2) if row["open"] is not None else None
-        result["high"] = round(float(row["high"]), 2) if row["high"] is not None else None
-        result["low"] = round(float(row["low"]), 2) if row["low"] is not None else None
-        result["pct_change"] = round(float(row["pct_change"]), 2) if row["pct_change"] is not None else 0.0
-        result["amount_wan"] = round(float(row["amount_wan"]), 2) if row["amount_wan"] is not None else None
-        result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
-        result["liquidity_ratio_pct"] = round(float(liquidity_ratio_pct), 2) if liquidity_ratio_pct is not None else None
-        result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
-        results.append(result)
+        for row in candidates:
+            kline = load_qfq_bars(conn, row["code"], required_rows=lookback_days + 80)
+            if kline.empty or len(kline) < lookback_days // 2:
+                missing_kline += 1
+                continue
+            analyzed_count += 1
+            float_mv_yi = row["float_mv_yi"] if "float_mv_yi" in row.keys() else None
+            liquidity_ratio_pct = row["liquidity_ratio_pct"] if "liquidity_ratio_pct" in row.keys() else None
+            result = analyze_stock(
+                row["code"],
+                row["name"],
+                kline,
+                scoring_mode=scoring_mode,
+                float_mv_yi=float_mv_yi,
+                liquidity_ratio_pct=liquidity_ratio_pct,
+            )
+            if result is None:
+                continue
+            result["board"] = row["board"]
+            result["close"] = round(float(row["close"]), 2) if row["close"] is not None else result["close"]
+            result["open"] = round(float(row["open"]), 2) if row["open"] is not None else None
+            result["high"] = round(float(row["high"]), 2) if row["high"] is not None else None
+            result["low"] = round(float(row["low"]), 2) if row["low"] is not None else None
+            result["pct_change"] = round(float(row["pct_change"]), 2) if row["pct_change"] is not None else 0.0
+            result["amount_wan"] = round(float(row["amount_wan"]), 2) if row["amount_wan"] is not None else None
+            result["float_mv_yi"] = round(float(row["float_mv_yi"]), 2) if row["float_mv_yi"] is not None else None
+            result["liquidity_ratio_pct"] = round(float(liquidity_ratio_pct), 2) if liquidity_ratio_pct is not None else None
+            result["volume"] = round(float(row["volume"]), 2) if row["volume"] is not None else None
+            results.append(result)
 
-    results.sort(key=lambda item: item["score"], reverse=True)
-    store_indicator_snapshots(conn, trade_date, results)
-    conn.close()
+        results.sort(key=lambda item: item["score"], reverse=True)
+        store_indicator_snapshots(conn, trade_date, results)
 
-    return {
-        "review_date": trade_date,
-        "scoring_mode": scoring_mode,
-        "candidate_count": len(candidates),
-        "analyzed_count": analyzed_count,
-        "missing_kline_count": missing_kline,
-        "signal_count": len(results),
-        "results": results,
-    }
+        return {
+            "review_date": trade_date,
+            "scoring_mode": scoring_mode,
+            "candidate_count": len(candidates),
+            "analyzed_count": analyzed_count,
+            "missing_kline_count": missing_kline,
+            "signal_count": len(results),
+            "results": results,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def load_snapshots(review_date: str | None = None) -> list[dict]:
@@ -793,41 +834,51 @@ def record_review_run(
     compute_summary: dict,
     notes: str = "",
 ) -> None:
-    conn = get_db_connection()
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO review_runs(
-                review_date, started_at, finished_at, status, universe_count, candidate_count,
-                analyzed_count, signal_count, markdown_path, csv_path, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(review_date) DO UPDATE SET
-                started_at = excluded.started_at,
-                finished_at = excluded.finished_at,
-                status = excluded.status,
-                universe_count = excluded.universe_count,
-                candidate_count = excluded.candidate_count,
-                analyzed_count = excluded.analyzed_count,
-                signal_count = excluded.signal_count,
-                markdown_path = excluded.markdown_path,
-                csv_path = excluded.csv_path,
-                notes = excluded.notes
-            """,
-            (
-                review_date,
-                started_at,
-                finished_at,
-                status,
-                sync_summary.get("universe_count"),
-                compute_summary.get("candidate_count"),
-                compute_summary.get("analyzed_count"),
-                compute_summary.get("signal_count"),
-                str(markdown_path),
-                str(csv_path),
-                notes,
-            ),
-        )
-    conn.close()
+    def _write() -> None:
+        conn = get_db_connection()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO review_runs(
+                        review_date, started_at, finished_at, status, universe_count, candidate_count,
+                        analyzed_count, signal_count, markdown_path, csv_path, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(review_date) DO UPDATE SET
+                        started_at = excluded.started_at,
+                        finished_at = excluded.finished_at,
+                        status = excluded.status,
+                        universe_count = excluded.universe_count,
+                        candidate_count = excluded.candidate_count,
+                        analyzed_count = excluded.analyzed_count,
+                        signal_count = excluded.signal_count,
+                        markdown_path = excluded.markdown_path,
+                        csv_path = excluded.csv_path,
+                        notes = excluded.notes
+                    """,
+                    (
+                        review_date,
+                        started_at,
+                        finished_at,
+                        status,
+                        sync_summary.get("universe_count"),
+                        compute_summary.get("candidate_count"),
+                        compute_summary.get("analyzed_count"),
+                        compute_summary.get("signal_count"),
+                        str(markdown_path),
+                        str(csv_path),
+                        notes,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    try:
+        run_with_sqlite_lock_retry("写入 review_runs", _write)
+    except Exception as exc:
+        if not is_locked_error(exc):
+            raise
+        print("[DB] review_runs 持续被锁定，已跳过本次运行记录写入")
 
 
 def get_review_run_record(review_date: str) -> dict | None:
