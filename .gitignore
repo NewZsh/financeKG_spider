@@ -1,3 +1,6 @@
+*.csv
+*.out
+
 # Git ignore rules for FinanceKG_spider
 
 # Exclude data directories (raw data, downloaded files, outputs)

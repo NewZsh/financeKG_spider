@@ -26,7 +26,7 @@ from base_spider import base_spider
 class TYCSpider(base_spider):
     """天眼查爬虫 - 统一处理公司搜索和投资信息爬取"""
     
-    def __init__(self, id_collect_queue):
+    def __init__(self, id_collect_queue=None):
         super().__init__(id_collect_queue)
         self.s_cfg = self.cfg[self.__class__.__name__]
         
@@ -219,19 +219,17 @@ class TYCSpider(base_spider):
             keyword: 搜索关键字
             page_num: 页码
             page_size: 每页数量
-        
+
         Returns:
-            dict: API 返回的响应数据
+            tuple: (response_data: dict | None, error_msg: str | None)
         """
         try:
             url = "https://capi.tianyancha.com/cloud-tempest/web/searchCompanyV4"
-            
-            # 构建请求体
+
             request_body = self.build_search_request_body(keyword, page_num, page_size)
-            
+
             self.logger.info(f"正在爬取关键字 '{keyword}' 的第 {page_num} 页搜索结果...")
-            
-            # 发送 POST 请求
+
             response = self.session.post(
                 url,
                 json=request_body,
@@ -239,28 +237,29 @@ class TYCSpider(base_spider):
                 allow_redirects=True
             )
             response.raise_for_status()
-            
-            # 解析 JSON 响应
+
             data = response.json()
-            
-            # 检查响应状态
+
             if data.get("state") == "ok":
                 self.logger.info(f"成功获取第 {page_num} 页数据")
-                return data
+                return data, None
             else:
-                error_msg = data.get("message", "Unknown error")
+                error_msg = data.get("message", "API 返回未知错误")
                 self.logger.error(f"API 返回错误: {error_msg}")
-                return None
-            
+                return None, error_msg
+
         except requests.exceptions.RequestException as e:
-            self.logger.exception(f"网络请求失败: {e}")
-            return None
+            error_msg = f"网络请求失败: {e}"
+            self.logger.exception(error_msg)
+            return None, error_msg
         except json.JSONDecodeError as e:
-            self.logger.exception(f"JSON 解析失败: {e}")
-            return None
+            error_msg = f"JSON 解析失败: {e}"
+            self.logger.exception(error_msg)
+            return None, error_msg
         except Exception as e:
-            self.logger.exception(f"获取搜索结果失败: {e}")
-            return None
+            error_msg = f"获取搜索结果失败: {e}"
+            self.logger.exception(error_msg)
+            return None, error_msg
 
     def __parse_investment_data(self, investments):
         """
@@ -568,24 +567,26 @@ class TYCSpider(base_spider):
         company_count = 0
         company_ids = []
         total_pages = 1
+        last_error = None
         sleep_seconds = self.get_request_sleep_seconds()
-        
+
         while True:
             # 发送请求前等待
             if page_num > 1:
                 self.logger.info(f"等待 {sleep_seconds} 秒后发送下一个请求...")
                 time.sleep(sleep_seconds)
-            
+
             # 检查是否超过最大页数限制
             if max_page and page_num > max_page:
                 self.logger.info(f"已达到最大页数限制 {max_page}，停止爬取")
                 break
-            
+
             # 获取当前页数据
-            response_data = self.__get_search_page(keyword, page_num, page_size)
-            
+            response_data, error_msg = self.__get_search_page(keyword, page_num, page_size)
+
             if response_data is None:
-                self.logger.error(f"获取第 {page_num} 页失败，停止爬取")
+                last_error = error_msg or "未知错误"
+                self.logger.error(f"获取第 {page_num} 页失败: {last_error}，停止爬取")
                 failure_count += 1
                 if failure_count >= self.headers_trial_limit:
                     self.logger.error("连续多次请求失败，请求头设置为无效，等待人工干预")
@@ -660,10 +661,14 @@ class TYCSpider(base_spider):
             "total_companies": company_count,
             "total_pages": total_pages,
             "company_ids": company_ids,
+            "error": last_error,
             "timestamp": datetime.now().isoformat()
         }
-        
-        self.logger.info(f"搜索完成: 共找到 {company_count} 家公司，跨越 {total_pages} 页")
+
+        if last_error:
+            self.logger.warning(f"搜索完成: 共找到 {company_count} 家公司（最后错误: {last_error}）")
+        else:
+            self.logger.info(f"搜索完成: 共找到 {company_count} 家公司，跨越 {total_pages} 页")
 
         # 新发现的 id 继续加入队列
         new_ids = self.filter_new_ids(company_ids)
@@ -750,9 +755,14 @@ def test_company_search(keywords=None, max_page=None, save_to_file=True, output_
             try:
                 result = spider.search_companies(keyword, max_page=max_page, save_to_file=save_to_file)
                 all_results.append(result)
-                print(f"✓ {keyword}: 共找到 {result['total_companies']} 家公司")
+                if result.get("error"):
+                    print(f"✗ {keyword}: 爬取失败 - {result['error']}")
+                elif result['total_companies'] > 0:
+                    print(f"✓ {keyword}: 共找到 {result['total_companies']} 家公司")
+                else:
+                    print(f"✗ {keyword}: API 返回 0 家公司（最后错误: {result.get('error', '无额外信息')}）")
             except Exception as e:
-                print(f"✗ {keyword}: 搜索失败 - {e}")
+                print(f"✗ {keyword}: 搜索异常 - {e}")
                 spider.logger.exception(f"搜索 {keyword} 失败")
     
     finally:

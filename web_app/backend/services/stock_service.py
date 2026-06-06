@@ -1,6 +1,6 @@
 from .graph_service import find_company_by_stock, get_company_graph
 from stock.directory import stock_directory_service
-from financeKG_spider.stock.sync_market_data import StockMarketDataReader
+from stock.sync_market_data import StockMarketDataReader
 
 
 def lookup_stock_info(query_type: str, keyword: str):
