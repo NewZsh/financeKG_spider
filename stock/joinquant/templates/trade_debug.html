@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JoinQuant 策略调试看板</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --panel: rgba(255, 251, 245, 0.92);
+      --ink: #1d2a36;
+      --muted: #5a6672;
+      --line: rgba(29, 42, 54, 0.12);
+      --accent: #0b7285;
+      --up: #cf3f3f;
+      --down: #237a57;
+      --warn: #d97706;
+      --shadow: 0 18px 44px rgba(29, 42, 54, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "SF Pro SC", "Hiragino Sans GB", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(11, 114, 133, 0.18), transparent 36%),
+        radial-gradient(circle at bottom right, rgba(207, 63, 63, 0.12), transparent 28%),
+        linear-gradient(135deg, #f7f2ea 0%, #efe5d7 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      gap: 20px;
+      padding: 20px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .sidebar {
+      padding: 20px;
+      position: sticky;
+      top: 20px;
+      align-self: start;
+      max-height: calc(100vh - 40px);
+      overflow: auto;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.1;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+      margin-bottom: 18px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    .field label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    select {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fffdfa;
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin: 20px 0;
+    }
+
+    .stat-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .stat-value {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .symbol-list {
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }
+
+    .symbol-list h2,
+    .content h2 {
+      margin: 0 0 10px;
+      font-size: 16px;
+    }
+
+    .symbol-meta {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .content {
+      display: grid;
+      gap: 20px;
+    }
+
+    .hero {
+      padding: 22px 24px 14px;
+    }
+
+    .hero-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+
+    .hero-title {
+      margin: 0;
+      font-size: 30px;
+    }
+
+    .hero-range {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 6px;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .badge {
+      background: rgba(11, 114, 133, 0.1);
+      color: var(--accent);
+      border: 1px solid rgba(11, 114, 133, 0.18);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .chart-wrap {
+      padding: 10px 12px 18px;
+    }
+
+    .chart-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 8px 10px 14px;
+    }
+
+    .chart-controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .chart-btn {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.88);
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, background 120ms ease;
+    }
+
+    .chart-btn:hover {
+      background: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .chart-hint {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    #chart {
+      height: 720px;
+    }
+
+    .table-wrap {
+      padding: 18px 20px 22px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .buy { color: var(--up); font-weight: 700; }
+    .sell { color: var(--down); font-weight: 700; }
+    .failed { color: var(--warn); font-weight: 700; }
+    .profit { color: var(--up); }
+    .loss { color: var(--down); }
+
+    .loading,
+    .empty {
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 1100px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+        max-height: none;
+      }
+
+      #chart {
+        height: 560px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar panel">
+      <h1>策略调试看板</h1>
+      <div class="subtle">本地读取 <strong>JoinQuant 成交日志</strong> + <strong>stock.db 日线</strong>，用蜡烛图、均线、成交标记和累计盈亏一起看策略行为。</div>
+
+      <div class="field">
+        <label for="logSelect">日志文件</label>
+        <select id="logSelect"></select>
+      </div>
+
+      <div class="field">
+        <label for="symbolSelect">股票</label>
+        <select id="symbolSelect"></select>
+      </div>
+
+      <div class="stat-grid" id="portfolioStats"></div>
+
+      <div class="symbol-list">
+        <h2>当前提示</h2>
+        <div class="symbol-meta">
+          1. 鼠标移到蜡烛上：看 OHLC、MA5/10/20/30、当日委托、当日/累计盈亏。<br>
+          2. 鼠标移到买卖点：看单笔委托时间、价格、成交状态。<br>
+          3. 灰色菱形代表日志里记录了委托，但实际未成交。<br>
+          4. 股票顺序按首次买入顺序排列；K线统一展示为日志最早日期前10天到日志最后日期。
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <section class="hero panel">
+        <div class="hero-top">
+          <div>
+            <h2 class="hero-title" id="heroTitle">载入中...</h2>
+            <div class="hero-range" id="heroRange"></div>
+          </div>
+          <div class="badges" id="symbolBadges"></div>
+        </div>
+      </section>
+
+      <section class="panel chart-wrap">
+        <div class="chart-toolbar">
+          <div class="chart-controls">
+            <button class="chart-btn" id="panLeftBtn" type="button">← 左移</button>
+            <button class="chart-btn" id="panRightBtn" type="button">右移 →</button>
+            <button class="chart-btn" id="zoomInBtn" type="button">＋ 放大</button>
+            <button class="chart-btn" id="zoomOutBtn" type="button">－ 缩小</button>
+            <button class="chart-btn" id="resetViewBtn" type="button">重置视图</button>
+          </div>
+          <div class="chart-hint">拖拽可平移，滚轮可缩放，键盘支持 <strong>←/→</strong> 平移、<strong>+</strong>/<strong>-</strong> 缩放、<strong>0</strong> 重置。</div>
+        </div>
+        <div id="chart"></div>
+      </section>
+
+      <section class="panel table-wrap">
+        <h2>该股日志委托明细</h2>
+        <div id="tradeTable"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      logs: [],
+      currentLog: null,
+      summary: null,
+      currentCode: null,
+      chartData: null,
+    };
+
+    const logSelect = document.getElementById('logSelect');
+    const symbolSelect = document.getElementById('symbolSelect');
+    const portfolioStats = document.getElementById('portfolioStats');
+    const heroTitle = document.getElementById('heroTitle');
+    const heroRange = document.getElementById('heroRange');
+    const symbolBadges = document.getElementById('symbolBadges');
+    const tradeTable = document.getElementById('tradeTable');
+    const chartElement = document.getElementById('chart');
+    const panLeftBtn = document.getElementById('panLeftBtn');
+    const panRightBtn = document.getElementById('panRightBtn');
+    const zoomInBtn = document.getElementById('zoomInBtn');
+    const zoomOutBtn = document.getElementById('zoomOutBtn');
+    const resetViewBtn = document.getElementById('resetViewBtn');
+
+    function formatMoney(value) {
+      const number = Number(value || 0);
+      return number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function statCard(label, value, className = '') {
+      return `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${className}">${value}</div></div>`;
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+      return response.json();
+    }
+
+    function renderPortfolioStats(summary) {
+      portfolioStats.innerHTML = [
+        statCard('日志股票数', summary.symbol_count),
+        statCard('委托总数', summary.trade_count),
+        statCard('成交笔数', summary.executed_count),
+        statCard('未成交笔数', summary.failed_count, summary.failed_count ? 'failed' : ''),
+        statCard('累计平仓盈亏', formatMoney(summary.realized_pnl), summary.realized_pnl >= 0 ? 'profit' : 'loss'),
+        statCard('累计净盈亏', formatMoney(summary.net_pnl), summary.net_pnl >= 0 ? 'profit' : 'loss'),
+      ].join('');
+    }
+
+    function renderSymbolOptions(summary) {
+      symbolSelect.innerHTML = summary.symbols.map(symbol => {
+        const label = `${symbol.code} ${symbol.name} | ${symbol.trade_count}笔 | 净盈亏 ${formatMoney(symbol.net_pnl)}`;
+        return `<option value="${symbol.code}">${label}</option>`;
+      }).join('');
+      state.currentCode = summary.symbols[0]?.code || null;
+      if (state.currentCode) {
+        symbolSelect.value = state.currentCode;
+      }
+    }
+
+    function renderTradeTable(rows) {
+      if (!rows.length) {
+        tradeTable.innerHTML = '<div class="empty">当前股票没有可展示的委托记录。</div>';
+        return;
+      }
+
+      const body = rows.map(row => {
+        const sideClass = row.side === '买' ? 'buy' : 'sell';
+        const statusClass = row.status_text === '成交' ? sideClass : 'failed';
+        const pnlClass = row.net_pnl >= 0 ? 'profit' : 'loss';
+        return `
+          <tr>
+            <td>${row.trade_date}</td>
+            <td>${row.trade_time}</td>
+            <td class="${sideClass}">${row.side}</td>
+            <td>${row.order_type}</td>
+            <td>${row.quantity}</td>
+            <td>${row.price == null ? '--' : Number(row.price).toFixed(2)}</td>
+            <td class="${statusClass}">${row.status_text}</td>
+            <td>${formatMoney(row.realized_pnl)}</td>
+            <td>${formatMoney(row.fee)}</td>
+            <td class="${pnlClass}">${formatMoney(row.net_pnl)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      tradeTable.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>时间</th>
+              <th>方向</th>
+              <th>单型</th>
+              <th>数量</th>
+              <th>价格</th>
+              <th>状态</th>
+              <th>平仓盈亏</th>
+              <th>手续费</th>
+              <th>净盈亏</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      `;
+    }
+
+    function markerTrace(name, markerData, color, symbol, yaxis = 'y') {
+      return {
+        type: 'scatter',
+        mode: 'markers+text',
+        name,
+        x: markerData.x,
+        y: markerData.y,
+        yaxis,
+        text: markerData.text,
+        textposition: 'top center',
+        customdata: markerData.custom,
+        marker: {
+          size: 11,
+          color,
+          symbol,
+          line: { width: 1, color: 'rgba(29,42,54,0.55)' },
+        },
+        hovertemplate:
+          '<b>%{x}</b><br>' +
+          '时间: %{customdata[0]}<br>' +
+          '方向: %{customdata[1]}<br>' +
+          '数量: %{customdata[2]}股<br>' +
+          '价格: %{customdata[3]}<br>' +
+          '状态: %{customdata[4]}<br>' +
+          '单型: %{customdata[5]}<br>' +
+          '平仓盈亏: %{customdata[6]}<br>' +
+          '手续费: %{customdata[7]}<br>' +
+          '净盈亏: %{customdata[8]}<extra></extra>',
+      };
+    }
+
+    function getFullDateRange() {
+      const dates = state.chartData?.dates || [];
+      if (!dates.length) {
+        return null;
+      }
+      return [new Date(dates[0]), new Date(dates[dates.length - 1])];
+    }
+
+    function getCurrentRange() {
+      const layout = chartElement.layout;
+      if (layout?.xaxis?.range?.length === 2) {
+        return [new Date(layout.xaxis.range[0]), new Date(layout.xaxis.range[1])];
+      }
+      return getFullDateRange();
+    }
+
+    function relayoutDateRange(start, end) {
+      Plotly.relayout(chartElement, {
+        'xaxis.range': [start.toISOString(), end.toISOString()],
+      });
+    }
+
+    function panRange(direction) {
+      const range = getCurrentRange();
+      if (!range) {
+        return;
+      }
+      const [start, end] = range;
+      const span = end.getTime() - start.getTime();
+      const shift = span * 0.25 * direction;
+      relayoutDateRange(new Date(start.getTime() + shift), new Date(end.getTime() + shift));
+    }
+
+    function zoomRange(factor) {
+      const range = getCurrentRange();
+      if (!range) {
+        return;
+      }
+      const [start, end] = range;
+      const mid = (start.getTime() + end.getTime()) / 2;
+      const half = ((end.getTime() - start.getTime()) * factor) / 2;
+      relayoutDateRange(new Date(mid - half), new Date(mid + half));
+    }
+
+    function resetChartView() {
+      Plotly.relayout(chartElement, { 'xaxis.autorange': true });
+    }
+
+    function renderChart(payload) {
+      heroTitle.textContent = `${payload.code} ${payload.name}`;
+      heroRange.textContent = `观察窗口 ${payload.window_start} ~ ${payload.window_end} | 日志文件 ${payload.log_name}`;
+      symbolBadges.innerHTML = [
+        `<div class="badge">该股委托 ${payload.symbol_summary.trade_count} 笔</div>`,
+        `<div class="badge">该股成交 ${payload.symbol_summary.executed_count} 笔</div>`,
+        `<div class="badge">该股未成交 ${payload.symbol_summary.failed_count} 笔</div>`,
+        `<div class="badge">该股净盈亏 ${formatMoney(payload.symbol_summary.net_pnl)}</div>`,
+        `<div class="badge">组合累计净盈亏 ${formatMoney(payload.portfolio_summary.net_pnl)}</div>`,
+      ].join('');
+
+      renderTradeTable(payload.trades);
+
+      const traces = [
+        {
+          type: 'candlestick',
+          name: 'K线',
+          x: payload.dates,
+          open: payload.open,
+          high: payload.high,
+          low: payload.low,
+          close: payload.close,
+          customdata: payload.hover_rows,
+          increasing: { line: { color: '#cf3f3f' }, fillcolor: '#cf3f3f' },
+          decreasing: { line: { color: '#237a57' }, fillcolor: '#237a57' },
+          hovertemplate:
+            '<b>%{x}</b><br>' +
+            '开: %{customdata[0]}<br>' +
+            '高: %{customdata[1]}<br>' +
+            '低: %{customdata[2]}<br>' +
+            '收: %{customdata[3]}<br>' +
+            '量: %{customdata[4]}<br>' +
+            'MA5: %{customdata[5]}<br>' +
+            'MA10: %{customdata[6]}<br>' +
+            'MA20: %{customdata[7]}<br>' +
+            'MA30: %{customdata[8]}<br>' +
+            '当日该股平仓盈亏: %{customdata[9]}<br>' +
+            '当日该股净盈亏: %{customdata[10]}<br>' +
+            '累计该股净盈亏: %{customdata[11]}<br>' +
+            '当日组合净盈亏: %{customdata[12]}<br>' +
+            '累计组合净盈亏: %{customdata[13]}<br>' +
+            '%{customdata[14]}<extra></extra>',
+        },
+        {
+          type: 'scatter',
+          mode: 'lines',
+          name: 'MA5',
+          x: payload.dates,
+          y: payload.ma5,
+          line: { color: '#ff6b6b', width: 1.7 },
+          hovertemplate: 'MA5 %{x}: %{y:.2f}<extra></extra>',
+        },
+        {
+          type: 'scatter',
+          mode: 'lines',
+          name: 'MA10',
+          x: payload.dates,
+          y: payload.ma10,
+          line: { color: '#1d4ed8', width: 1.6 },
+          hovertemplate: 'MA10 %{x}: %{y:.2f}<extra></extra>',
+        },
+        {
+          type: 'scatter',
+          mode: 'lines',
+          name: 'MA20',
+          x: payload.dates,
+          y: payload.ma20,
+          line: { color: '#0f766e', width: 1.8 },
+          hovertemplate: 'MA20 %{x}: %{y:.2f}<extra></extra>',
+        },
+        {
+          type: 'scatter',
+          mode: 'lines',
+          name: 'MA30',
+          x: payload.dates,
+          y: payload.ma30,
+          line: { color: '#7c3aed', width: 1.5, dash: 'dot' },
+          hovertemplate: 'MA30 %{x}: %{y:.2f}<extra></extra>',
+        },
+        markerTrace('买点', payload.buy_markers, '#cf3f3f', 'triangle-up'),
+        markerTrace('卖点', payload.sell_markers, '#237a57', 'triangle-down'),
+        markerTrace('未成交', payload.failed_markers, '#d97706', 'diamond'),
+      ];
+
+      const layout = {
+        margin: { t: 16, r: 20, b: 50, l: 50 },
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(255,255,255,0.55)',
+        legend: { orientation: 'h', x: 0, y: 1.08 },
+        hovermode: 'x unified',
+        dragmode: 'pan',
+        xaxis: {
+          rangeslider: { visible: true, thickness: 0.08 },
+          showgrid: false,
+          tickformat: '%Y-%m-%d',
+        },
+        yaxis: {
+          fixedrange: false,
+          gridcolor: 'rgba(29,42,54,0.08)',
+        },
+        font: { family: 'PingFang SC, SF Pro SC, sans-serif', color: '#1d2a36' },
+      };
+
+      Plotly.newPlot('chart', traces, layout, {
+        responsive: true,
+        displaylogo: false,
+        scrollZoom: true,
+        modeBarButtonsToAdd: ['pan2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+      });
+    }
+
+    async function loadChart() {
+      if (!state.currentLog || !state.currentCode) {
+        return;
+      }
+      heroTitle.textContent = '正在载入图表...';
+      tradeTable.innerHTML = '<div class="loading">正在拼接 K 线、均线和成交日志...</div>';
+      const payload = await fetchJson(`/api/chart-data?log=${encodeURIComponent(state.currentLog)}&code=${encodeURIComponent(state.currentCode)}`);
+      state.chartData = payload;
+      renderChart(payload);
+    }
+
+    async function loadSummary() {
+      if (!state.currentLog) {
+        return;
+      }
+      const summary = await fetchJson(`/api/log-summary?log=${encodeURIComponent(state.currentLog)}`);
+      state.summary = summary;
+      renderPortfolioStats(summary);
+      renderSymbolOptions(summary);
+      await loadChart();
+    }
+
+    async function bootstrap() {
+      const payload = await fetchJson('/api/logs');
+      state.logs = payload.logs;
+      if (!payload.logs.length) {
+        document.body.innerHTML = '<div class="empty">未在 joinquant/jqlog 下找到任何 .log 文件。</div>';
+        return;
+      }
+
+      logSelect.innerHTML = payload.logs.map(name => `<option value="${name}">${name}</option>`).join('');
+      state.currentLog = payload.default_log;
+      logSelect.value = payload.default_log;
+      await loadSummary();
+    }
+
+    logSelect.addEventListener('change', async (event) => {
+      state.currentLog = event.target.value;
+      await loadSummary();
+    });
+
+    symbolSelect.addEventListener('change', async (event) => {
+      state.currentCode = event.target.value;
+      await loadChart();
+    });
+
+    panLeftBtn.addEventListener('click', () => panRange(-1));
+    panRightBtn.addEventListener('click', () => panRange(1));
+    zoomInBtn.addEventListener('click', () => zoomRange(0.7));
+    zoomOutBtn.addEventListener('click', () => zoomRange(1.35));
+    resetViewBtn.addEventListener('click', () => resetChartView());
+
+    document.addEventListener('keydown', (event) => {
+      if (!state.chartData) {
+        return;
+      }
+      const target = event.target;
+      if (target && ['SELECT', 'INPUT', 'TEXTAREA'].includes(target.tagName)) {
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        panRange(-1);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        panRange(1);
+      } else if (event.key === '+' || event.key === '=') {
+        event.preventDefault();
+        zoomRange(0.7);
+      } else if (event.key === '-' || event.key === '_') {
+        event.preventDefault();
+        zoomRange(1.35);
+      } else if (event.key === '0') {
+        event.preventDefault();
+        resetChartView();
+      }
+    });
+
+    bootstrap().catch((error) => {
+      console.error(error);
+      document.body.innerHTML = `<div class="empty">加载失败：${error.message}</div>`;
+    });
+  </script>
+</body>
+</html>
