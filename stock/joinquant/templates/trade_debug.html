@@ -610,6 +610,21 @@
         markerTrace('买点', payload.buy_markers, '#cf3f3f', 'triangle-up'),
         markerTrace('卖点', payload.sell_markers, '#237a57', 'triangle-down'),
         markerTrace('未成交', payload.failed_markers, '#d97706', 'diamond'),
+        {
+          type: 'bar',
+          name: '成交量',
+          x: payload.dates,
+          y: payload.volume,
+          yaxis: 'y2',
+          marker: {
+            color: payload.close.map((c, i) => {
+              const o = payload.open[i];
+              return c >= o ? '#cf3f3f' : '#237a57';
+            }),
+            opacity: 0.5,
+          },
+          hovertemplate: '成交量: %{y}<extra></extra>',
+        },
       ];
 
       const layout = {
@@ -620,13 +635,24 @@
         hovermode: 'x unified',
         dragmode: 'pan',
         xaxis: {
-          rangeslider: { visible: true, thickness: 0.08 },
+          rangeslider: { visible: false },
           showgrid: false,
           tickformat: '%Y-%m-%d',
+          rangebreaks: [
+            { values: payload.non_trading_days || [] }
+          ]
         },
         yaxis: {
+          domain: [0.3, 1],
           fixedrange: false,
           gridcolor: 'rgba(29,42,54,0.08)',
+          title: '价格',
+        },
+        yaxis2: {
+          domain: [0, 0.25],
+          fixedrange: false,
+          gridcolor: 'rgba(29,42,54,0.08)',
+          title: '成交量',
         },
         font: { family: 'PingFang SC, SF Pro SC, sans-serif', color: '#1d2a36' },
       };

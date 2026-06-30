@@ -12,3 +12,4 @@ python-multipart>=0.0.20
 py2neo
 akshare>=1.18.41
 mplfinance>=0.12.7a17
+chinesecalendar

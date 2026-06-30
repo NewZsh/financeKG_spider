@@ -8,18 +8,20 @@ import math
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 from flask import Flask, abort, jsonify, render_template, request
+import chinese_calendar
 
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "stock.db"
 LOG_DIR = BASE_DIR / "jqlog"
-DEFAULT_PRE_DAYS = 10
+DEFAULT_PRE_DAYS = 90
 DEFAULT_POST_DAYS = 0
 
 TRADE_LINE_RE = re.compile(r"^(?P<name>.+?)\((?P<code>\d{6})\.(?P<exchange>[A-Z]+)\)$")
@@ -278,6 +280,21 @@ def sanitize_json_value(value):
     return value
 
 
+def get_non_trading_days(start_str: str, end_str: str) -> list[str]:
+    """获取指定范围内的非交易日（周六日及节假日）"""
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_str, "%Y-%m-%d").date()
+    
+    non_trading_days = []
+    curr = start_dt
+    while curr <= end_dt:
+        # 如果是周六日，或者虽是工作日但属于法定节假日，则为非交易日
+        if curr.weekday() >= 5 or chinese_calendar.is_holiday(curr):
+            non_trading_days.append(curr.strftime("%Y-%m-%d"))
+        curr += timedelta(days=1)
+    return non_trading_days
+
+
 def build_chart_payload(log_name: str, code: str) -> dict:
     trades = [trade for trade in get_log_trades(log_name) if trade.code == code]
     if not trades:
@@ -400,6 +417,7 @@ def build_chart_payload(log_name: str, code: str) -> dict:
         "symbol_text": trades[0].symbol_text,
         "window_start": start_date,
         "window_end": end_date,
+        "non_trading_days": get_non_trading_days(start_date, end_date),
         "dates": bar_dates.tolist(),
         "open": bars["open"].round(4).tolist(),
         "high": bars["high"].round(4).tolist(),
