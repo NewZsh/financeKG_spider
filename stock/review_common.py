@@ -904,6 +904,8 @@ def ensure_review_market_data_ready(review_date: str) -> dict:
     status = reader.has_market_data_for_date(trade_date)
     status["is_trade_day"] = reader.is_trade_day(trade_date)
     status["suggested_command"] = f"python -m stock.sync_market_data --start-date {trade_date} --end-date {trade_date}"
+    status["errors"] = []
+    status["db_path"] = str(DB_PATH)
     if not status["is_trade_day"]:
         status["is_ready_for_review"] = True
         status["check_message"] = f"{trade_date} 非交易日，跳过当日同步校验，直接使用数据库中最近交易日数据。"
