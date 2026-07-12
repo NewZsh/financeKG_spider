@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+JoinQuant 策略成交调试看板
+
+用法：
+    python trade_debug_app.py
+"""
+
 from __future__ import annotations
 
 import argparse

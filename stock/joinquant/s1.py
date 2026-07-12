@@ -31,9 +31,11 @@
     - age：进入观察池后的存续天数。
 7. 观察池最大容量限制为 500 只。
 
-- market_open 开盘先优先处理 pending_exit_stocks：
-    - 这些股票是前一日触发卖出，但因为跌停或流动性枯竭未卖掉的持仓。
-    - 策略会在次日开盘直接按市价分单挂单，优先解决风险暴露，而不是继续做新交易。
+- market_open 开盘风险拦截与补卖处理：
+    - 拦截开盘直接跌停的持仓：若今日开盘即跌停，立即挂跌停价卖单。
+    - 处理历史待补卖池 pending_exit_stocks：
+        - 若依然跌停开盘：继续挂跌停价卖单，“死磕”流动性。
+        - 若已打开跌停：暂不操作，留待 14:57 进行“收复判定”。
 
 - market_intraday 分钟级盘中买卖 & 持仓 
 1. 仓位管理：保持30%现金，如果不足，则不再触发新的买入，等待下一次机会；且单个股票在单次建仓周期内最多只买一次、总买入金额不超过 10w RMB。
@@ -50,7 +52,9 @@
     - 买入后股票会从观察池删除，避免同一天重复触发。
 4. 持仓风控
     - 规则卖出：对于突然某天变成 ST、*ST、名称含“退”的股票，开盘后立即按市价卖出，当天必须完成清仓。
-    - 对已经进入 pending_exit_stocks 的股票，不再重复执行常规止盈止损，避免重复报单。
+    - 对已经进入待补卖池的股票，在 14:57 执行“锁死收复判定”：
+        - 若当前价格同时收复了“锁死价”且突破了 MA20：视为转强，移出补卖池，恢复正常持仓。
+        - 否则：立即市价止损出场，以防再次锁死。
     - 对普通持仓，策略会计算：
         - 14:57 附近的盘中价格。
         - 最近 20 日均线 MA20。
@@ -74,11 +78,7 @@
         - 若本次属于亏损卖出，则连续亏损计数 +1；否则清零。
         - 当连续亏损次数达到 5 次时，触发策略熔断，冻结买入 8 个交易日。
 
-- after_market_close 盘后异常审计 
-1. 策略会复盘当天全部订单，重点检查卖出单（action == 'close'）。
-2. 如果卖出单状态为 canceled 或 rejected，且收盘后该股票仍在实际持仓中，则认定为“卖出死锁”。
-3. 死锁股票会被加入 g.pending_exit_stocks，等待下一交易日开盘继续按市价排队卖出。
-4. 这一机制主要解决日内卖出指令发出后，由于跌停封单或流动性枯竭造成的未成交问题。
+- after_market_close 盘后异常审计：复盘今日卖出单，若发现因跌停等原因导致“撤单/拒绝”且仍有持仓，则记录锁定价格并加入待补卖池。
 
 - 策略流程 UML
 ```mermaid
@@ -93,7 +93,7 @@ flowchart TD
     D1a --> D3
     D3 --> E[扫描全市场主板突破股]
     E --> F[满足突破条件则加入观察池]
-    F --> MO[开盘：优先处理待补卖池 / 强制清仓ST持仓]
+    F --> MO[开盘：拦截新跌停股及执行历史跌停股死磕挂单]
     MO --> G[盘中每分钟执行 market_intraday]
     G --> H{沪深300趋势是否允许交易}
     H -- 否 --> H1[停止当日盘中选股]
@@ -102,19 +102,21 @@ flowchart TD
     I -- 是 --> J[当日盘中单次买入且单股不超10w]
     J --> K[记录买入成本和最高浮盈]
     K --> L[14:57 检查持仓风控]
-    L --> N{是否触发卖出条件}
+    L --> PS{补卖池是否收复锁死价与MA20}
+    PS -- 是 --> PS1[移出补卖池恢复正常持有]
+    PS -- 否 --> PS2[市价强行清仓]
+    PS1 --> N
+    PS2 --> N
+    L --> N{个股是否满足常规卖出条件}
     N -- 否 --> O[继续持有]
-    N -- 移动止盈 --> P1[按半仓或全仓止盈并重置最高浮盈]
-    P1 --> P2[标记当日已触发止盈不再重复]
-    P2 --> Q[止盈/止损善后：加黑名单/计亏损/清缓存]
-    N -- 刚性止损5% --> P3[全仓清出]
+    N -- 移动止盈 --> P1[按次/半仓止盈并重置运行状态]
+    P1 --> Q[止盈/止损善后：加黑名单/计亏损/清缓存]
+    N -- 跌破MA20/反向金叉/刚性止损 --> P3[全仓清出]
     P3 --> Q
-    N -- 趋势止损价格跌破MA20或MA20上穿MA5/MA10 --> P4[全仓清出]
-    P4 --> Q
-    Q --> R{卖出是否失败且仍有持仓}
+    Q --> R{卖出单是否因跌停失败且仍有实仓}
     R -- 否 --> S[正常结束]
-    R -- 是 --> T[加入待补卖池]
-    T --> U[次日开盘按市价分单继续卖出]
+    R -- 是 --> T[记录锁死价入补卖池]
+    T --> MO
 ```
 """
 from jqdata import *
@@ -138,32 +140,39 @@ def order_buy_once(security, total_value, reference_price):
     return total_amount
 
 
-def order_amount_in_chunks(security, total_amount, reference_price):
+def order_amount_in_chunks(security, total_amount, reference_price, is_limit=False):
     if total_amount == 0:
         return
 
+    # 强制取整，避免浮点数精度导致 0 股卖单
+    total_amount = int(total_amount)
+    if total_amount == 0:
+        return
+
+    order_style = LimitOrderStyle(reference_price) if is_limit else None
+
     if reference_price is None or np.isnan(reference_price) or reference_price <= 0:
-        order(security, total_amount)
+        order(security, total_amount, style=order_style)
         return
 
     max_chunk_amount = int(MAX_TRADE_VALUE / reference_price / 100) * 100
     if max_chunk_amount <= 0:
-        order(security, total_amount)
+        order(security, total_amount, style=order_style)
         return
 
     direction = 1 if total_amount > 0 else -1
-    remaining_amount = abs(int(total_amount))
+    remaining_amount = abs(total_amount)
 
     while remaining_amount > 0:
         if remaining_amount < 100:
             chunk_amount = remaining_amount
         else:
             chunk_amount = min(remaining_amount, max_chunk_amount)
-            if chunk_amount < 100:
-                order(security, direction * remaining_amount)
-                return
+            # 处理不足一手碎股，一并打包卖出或买入
+            if (remaining_amount - chunk_amount) > 0 and (remaining_amount - chunk_amount) < 100:
+                chunk_amount = remaining_amount
 
-        order(security, direction * chunk_amount)
+        order(security, direction * chunk_amount, style=order_style)
         remaining_amount -= chunk_amount
 
 # ==================== 1. 框架初始化函数 ====================
@@ -172,12 +181,12 @@ def initialize(context):
     set_benchmark('000300.XSHG')
     # 开启真实价格复权模式
     set_option('use_real_price', True)
-    log.info('【V6.5-全市场沪深主板·跌停修复全闭环版】启动...')
+    log.info('【趋势版本v1.0】启动...')
 
     # 主板标准交易佣金设置（自适应主板最低5元佣金）
     set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003, close_commission=0.0003, min_commission=5), type='stock')
 
-    # 全局变量初始化
+    # 全局变量
     g.buy_cost_dict = {}          # 记录个股真实买入成本 {stock: price}
     g.max_pnl_dict = {}           # 记录个股持仓最高收益率（用于移动止盈）
     g.blacklist_dict = {}         # 黑名单，防止短期重复踩雷 {stock: delete_date}
@@ -188,6 +197,14 @@ def initialize(context):
     g.position_lock_stocks = set() # 已开仓未完全退出的股票，持仓周期内禁止再次买入
     g.trailing_stop_last_date = {} # 记录个股最近一次卖出触发日期，防止同日重复卖出
     g.today_buy_count = 0        # 记录当日已买入股票数量
+
+    # 跟踪当天盘中买入但尚未获得日线确认的股票（用于次日开盘按市价强制卖出）
+    g.intraday_unconfirmed_buys = set()
+    # 次日一开盘需要强制卖出的股票集合（由盘后审计决定）
+    g.next_open_forced_sell = set()
+
+    g.is_market_safe = False     # 【高频缓存】记录当日大盘趋势是否安全
+    g.watch_pool_static = {}     # 【高频缓存】存储观察池个股的历史截面静态相，避免盘中高频请求
 
     # ------------------ 🛠️ 核心修复注入：死磕防死锁全局池 ------------------
     # 记录由于跌停导致未能成功止盈止损的股票池 { 股票代码: 触发原因 }
@@ -312,62 +329,123 @@ def before_market_open(context):
     main_board_pool = get_main_board_pool(context)
     
     # 限制池子最大承载量，防止内存泄露和过度分散
-    if len(g.watch_pool) >= 500:
-        return
-
-    for stock in main_board_pool:
-        # 已经在观察池或已持仓或在黑名单的，不再重复扫描
-        if stock in g.watch_pool or stock in context.portfolio.positions or stock in g.blacklist_dict or stock in g.position_lock_stocks:
-            continue
+    if len(g.watch_pool) < 500:
+        for stock in main_board_pool:
+            # 已经在观察池或已持仓或在黑名单的，不再重复扫描
+            if stock in g.watch_pool or stock in context.portfolio.positions or stock in g.blacklist_dict or stock in g.position_lock_stocks:
+                continue
+                
+            # 批量获取个股历史K线进行技术指标计算
+            df = get_bars(stock, count=40, unit='1d', fields=['open', 'close', 'volume'], include_now=False)
+            if len(df) < 35: continue
             
-        # 批量获取个股历史K线进行技术指标计算
-        df = get_bars(stock, count=40, unit='1d', fields=['open', 'close', 'volume'], include_now=False)
-        if len(df) < 35: continue
-        
-        last_close, last_open, last_vol = df['close'][-1], df['open'][-1], df['volume'][-1]
-        ma5, ma10, ma20 = df['close'][-5:].mean(), df['close'][-10:].mean(), df['close'][-20:].mean()
-        
-        # 计算成交量 Z-Score 爆量系数
-        vol_series = df['volume'][-22:-1]
-        z_score = (last_vol - vol_series.mean()) / vol_series.std() if vol_series.std() > 0 else 0
-        
-        # 多头排列形态 + 主板放量大阳线(涨幅>4%)
-        is_ma_ok = last_close > ma5 > ma10
-        is_price_ok = (last_close / last_open > 1.04) or (last_close / df['close'][-2] > 1.04) 
-        is_vol_ok = z_score > 1.2 and last_vol > df['volume'][-2]
-        
-        if is_ma_ok and is_price_ok and is_vol_ok:
-            g.watch_pool[stock] = {
-                'breakout_date': current_date,
-                'max_raise_vol': last_vol,  
-                'breakout_price': max(last_open, last_close), 
-                'age': 0,
-                'max_drop_vol': 0.0  
+            last_close, last_open, last_vol = df['close'][-1], df['open'][-1], df['volume'][-1]
+            ma5, ma10, ma20 = df['close'][-5:].mean(), df['close'][-10:].mean(), df['close'][-20:].mean()
+            
+            # 计算成交量 Z-Score 爆量系数
+            vol_series = df['volume'][-22:-1]
+            z_score = (last_vol - vol_series.mean()) / vol_series.std() if vol_series.std() > 0 else 0
+            
+            # 多头排列形态 + 主板放量大阳线(涨幅>4%)
+            is_ma_ok = last_close > ma5 > ma10
+            is_price_ok = (last_close / last_open > 1.04) or (last_close / df['close'][-2] > 1.04) 
+            is_vol_ok = z_score > 1.2 and last_vol > df['volume'][-2]
+            
+            if is_ma_ok and is_price_ok and is_vol_ok:
+                g.watch_pool[stock] = {
+                    'breakout_date': current_date,
+                    'max_raise_vol': last_vol,  
+                    'breakout_price': max(last_open, last_close), 
+                    'age': 0,
+                    'max_drop_vol': 0.0  
+                }
+                log.info(f"🎯 突破注入主板池 -> {stock} (Z-Score: {z_score:.2f}, 基准价: {g.watch_pool[stock]['breakout_price']:.2f})")
+                if len(g.watch_pool) >= 500: # 控量保护
+                    break
+
+    # ====== 新增：盘前预计算缓存，避免盘中每分钟重复请求K线致使系统限流卡死 ======
+    index_data = get_bars('000300.XSHG', count=60, unit='1d', fields=['close'], include_now=False)
+    if index_data is not None and len(index_data) > 0:
+        g.is_market_safe = index_data['close'][-1] >= index_data['close'].mean()
+    else:
+        g.is_market_safe = False
+
+    g.watch_pool_static = {}
+    for stock in list(g.watch_pool.keys()):
+        hist = get_bars(stock, count=20, unit='1d', fields=['open', 'close'], include_now=False)
+        if hist is not None and len(hist) >= 19:
+            g.watch_pool_static[stock] = {
+                't1_open': hist['open'][-1],
+                't1_close': hist['close'][-1],
+                # 如果要推算实时的 ma5, ma10，只需要存下昨天之前的 4天和9天求和基数即可
+                'sum_4': hist['close'][-4:].sum(),
+                'sum_9': hist['close'][-9:].sum()
             }
-            log.info(f"🎯 突破注入主板池 -> {stock} (Z-Score: {z_score:.2f}, 基准价: {g.watch_pool[stock]['breakout_price']:.2f})")
-            if len(g.watch_pool) >= 500: # 控量保护
-                break
 
 
 # ==================== 4. 📈 开盘补卖处理 ====================
 def market_open(context):
     current_data = get_current_data()
+    current_date = context.current_dt.date()
+    # 次日一开盘：优先处理前一日盘中买入但日线未确认的强制卖出列表
+    if getattr(g, 'next_open_forced_sell', None):
+        for security in list(g.next_open_forced_sell):
+            if security in context.portfolio.positions:
+                pos = context.portfolio.positions[security]
+                amount = pos.closeable_amount
+                if amount > 0:
+                    log.warn(f"🛑 次日开盘强制清仓(无日线确认) -> {security} , 卖出数量: {amount}")
+                    # 市价卖出（不使用限价），尽快离场
+                    order_amount_in_chunks(security, -amount, None)
+                    g.trailing_stop_last_date[security] = current_date
+            # 无论是否仍持有，清理该标记
+            g.next_open_forced_sell.discard(security)
     
-    # ------------------ 🛠️ 核心修复注入：开盘死磕排队优先处理 ------------------
+    # 1. 如果开盘跌停，直接挂跌停卖
+    for security in list(context.portfolio.positions.keys()):
+        data = current_data[security]
+        pos = context.portfolio.positions[security]
+        
+        # 判断开盘是否跌停
+        if data.day_open <= data.low_limit:
+            # 去重：防止因为同日多次触发跌停而重复挂单
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+
+            amount = pos.closeable_amount
+            if amount > 0:
+                log.error(f"⚠️ [开盘风险拦截] 股票 {security} 今日开盘即跌停！挂跌停价限价单卖出 {amount} 股...")
+                order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
+                g.trailing_stop_last_date[security] = current_date
+            
+            # 2. 如果因为跌停卖不出去的，记录 locked_price 进入 pending_exit_stocks
+            if security not in g.pending_exit_stocks:
+                g.pending_exit_stocks[security] = data.low_limit
+
+    # ------------------ 🛠️ 核心修复注入：历史死磕池优先处理 ------------------
     if g.pending_exit_stocks:
-        log.warning(f"🔄 [开盘死磕激活] 发现有由于跌停未出货成功标的，今日开盘强行排队...")
+        log.warning(f"🔄 [待补卖池扫描] 正在检查 {len(g.pending_exit_stocks)} 只历史锁死标的...")
         for security in list(g.pending_exit_stocks.keys()):
             if security not in context.portfolio.positions:
                 g.pending_exit_stocks.pop(security, None)
                 continue
                 
-            # 直接按市价重新卖出，优先处理未完成离场的风险暴露
-            if security in current_data:
-                amount = context.portfolio.positions[security].total_amount
-                log.error(f"🎯 股票 {security} 上日清仓未成功。今日开盘按市价重新提交卖出单，数量: {amount}")
-                reference_price = current_data[security].day_open or current_data[security].last_price
-                order_amount_in_chunks(security, -amount, reference_price)
-    # ----------------------------------------------------------------------
+            data = current_data[security]
+            pos = context.portfolio.positions[security]
+            
+            # 同样去重，如果在上方已被处理则跳过
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+
+            # 如果依然以跌停开盘，继续尝试挂跌停价卖出
+            if data.day_open <= data.low_limit:
+                amount = pos.closeable_amount
+                if amount > 0:
+                    log.error(f"🎯 股票 {security} 今日依然跌停开盘。继续挂跌停价限价卖单，数量: {amount}")
+                    order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
+                    g.trailing_stop_last_date[security] = current_date
+            else:
+                log.info(f"ℹ️ 股票 {security} 今日已打开跌停开盘，将观察至 14:57 决定是否留活口...")
 
     # 规则卖出：持仓股突变 ST / *ST / 退市时开盘强制清仓
     for security in list(context.portfolio.positions.keys()):
@@ -391,9 +469,8 @@ def market_intraday(context):
     buy_budget = context.portfolio.available_cash - context.portfolio.total_value * 0.30
 
     if len(g.watch_pool) > 0 and buy_budget > 10000 and g.today_buy_count < MAX_BUYS_PER_DAY:
-        # 大盘中期趋势防守开关
-        index_data = get_bars('000300.XSHG', count=60, unit='1d', fields=['close'], include_now=False)['close']
-        if len(index_data) > 0 and index_data[-1] >= index_data.mean():
+        # 优化：大盘趋势缓存读取（摒弃盘中分钟级别请求极度耗时逻辑）
+        if getattr(g, 'is_market_safe', False):
             triggered_stocks = []
 
             # 循环遍历当前动态观察池内的所有主板个股
@@ -409,31 +486,32 @@ def market_intraday(context):
                 if stock in g.position_lock_stocks or stock in context.portfolio.positions:
                     continue
 
-                # 获取近期日线数据（用于反包判定及实时均线校验）
-                # 需足够数据计算均线，include_now=True 包含今日实时 bar
-                hist_1d = get_bars(stock, count=25, unit='1d', fields=['open', 'close'], include_now=True)
-                if len(hist_1d) < 21:
+                # 读取昨天的静态截面数据
+                static_info = getattr(g, 'watch_pool_static', {}).get(stock)
+                if not static_info:
                     continue
 
-                # 昨天的数据 (T-1)
-                t1_open, t1_close = hist_1d['open'][-2], hist_1d['close'][-2]
-                # 今日实时价格 (T)
-                current_price = current_data[stock].last_price if stock in current_data else hist_1d['close'][-1]
+                # 提取缓存的数据，t1_open 和 t1_close 是昨天的开盘价和收盘价
+                t1_open = static_info['t1_open']
+                t1_close = static_info['t1_close']
                 
-                # 计算今日实时均线 (MA5/10/20)
-                ma5 = hist_1d['close'][-5:].mean()
-                ma10 = hist_1d['close'][-10:].mean()
-                ma20 = hist_1d['close'][-20:].mean()
+                # 盘中只需要获取当下的市价即可，不再每次都取几十天前的数据求 MA
+                current_price = current_data[stock].last_price
+                open_price = current_data[stock].day_open
 
-                if np.isnan(current_price):
+                if np.isnan(current_price) or current_price <= 0:
                     continue
+
+                # 动态计算今日的有效 MA5 / MA10
+                ma5 = (static_info['sum_4'] + current_price) / 5
+                ma10 = (static_info['sum_9'] + current_price) / 10
 
                 # 🛑 检查1：昨天必须是真阴线（确认已发生洗盘）
                 if t1_close >= t1_open:
                     continue
 
-                # 🛑 检查2：今日实时价格上破昨日开盘价（反包确认）
-                if current_price <= t1_open:
+                # 🛑 检查2：今日开盘价格低于实时价格，且实时价格上破昨日开盘价（反包确认）
+                if current_price < open_price or current_price < t1_open:
                     continue
                 
                 # 🛑 检查3：价格区间重合校验。今日价格须大于突破日基准价（突破日开/收最大值）
@@ -459,12 +537,47 @@ def market_intraday(context):
                         g.buy_cost_dict[stock] = current_price
                         g.max_pnl_dict[stock] = 0.0
                         g.position_lock_stocks.add(stock)
+                        # 标记为盘中买入但尚未获得日线收盘确认的票
+                        g.intraday_unconfirmed_buys.add(stock)
                         g.today_buy_count += 1
                         del g.watch_pool[stock]
 
     # 5.2 持仓风控：仅在 14:57 及之后用盘中价格触发卖出
     if current_time < '14:57':
         return
+
+    # ------------------ 🛠️ 核心修复注入：历史锁死股 14:57 生死劫 ------------------
+    if g.pending_exit_stocks:
+        for security in list(g.pending_exit_stocks.keys()):
+            if security not in context.portfolio.positions:
+                g.pending_exit_stocks.pop(security, None)
+                continue
+            
+            # 若今日早盘已挂跌停单清仓过，可跳过本处理
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+
+            data = current_data[security]
+            # 只有在目前非跌停封死的情况下才进行观察
+            if data.last_price > data.low_limit:
+                # 修复: 均线必须 include_now=True 才会算上今天的真实反弹价格
+                hist_20d = get_bars(security, count=20, unit='1d', fields=['close'], include_now=True)
+                if len(hist_20d) < 20: continue
+                ma20 = hist_20d['close'].mean()
+                
+                locked_price = g.pending_exit_stocks[security]
+                
+                # 判定：收复锁死价格 并且 收复 MA20 (改进点4)
+                if data.last_price >= locked_price and data.last_price >= ma20:
+                    log.info(f"✅ [锁死收复] {security} 当前价 {data.last_price:.2f} 成功收复锁死价 {locked_price:.2f} 且突破 MA20({ma20:.2f})，剔除出补卖池，恢复正常持仓状态。")
+                    g.pending_exit_stocks.pop(security, None)
+                else:
+                    log.error(f"❌ [锁死未收复] {security} 14:57 未能收复锁死价 {locked_price:.2f} 或 MA20({ma20:.2f})，立即挂限价单清仓...")
+                    amount = context.portfolio.positions[security].closeable_amount
+                    if amount > 0:
+                        order_amount_in_chunks(security, -amount, data.last_price, is_limit=True)
+                        g.trailing_stop_last_date[security] = current_date
+                    g.pending_exit_stocks.pop(security, None)
 
     current_positions = context.portfolio.positions
     for security in list(current_positions.keys()):
@@ -479,7 +592,8 @@ def market_intraday(context):
         if position.closeable_amount == 0:
             continue
 
-        hist_data = get_bars(security, count=20, unit='1d', fields=['close'], include_now=False)
+        # 修改为 include_now=True，因为此时为14:57，判断当下的动态均线才具有意义
+        hist_data = get_bars(security, count=20, unit='1d', fields=['close'], include_now=True)
         if len(hist_data) < 20:
             continue
 
@@ -589,6 +703,20 @@ def after_market_close(context):
                 # 铁证如山：如果收盘了这只股票居然还在实际持仓清单里
                 if security in context.portfolio.positions:
                     if security not in g.pending_exit_stocks:
-                        g.pending_exit_stocks[security] = "V6.5风控单内遭遇极端跌停死锁"
-                        log.error(f"🚨 [日频死锁拦截] 发现持仓股 {security} 今日触发常规减仓却未能离场！收盘依然有实仓。")
+                        current_data = get_current_data()
+                        g.pending_exit_stocks[security] = current_data[security].low_limit
+                        log.error(f"🚨 [日频死锁拦截] 发现持仓股 {security} 今日触发常规减仓却未能离场！收盘依然有实仓。跌停锁死价: {current_data[security].low_limit}")
                         log.error(f"该股已被强行拖入【每日死磕补单池】，明日（包含下周一）开盘第一分钟自动按市价继续卖出！")
+    # ====== 盘后审计：评估当天盘中买入但未获日线确认的个股，若收盘日线未能收复前日则次日强制开盘卖出 ======
+    if getattr(g, 'intraday_unconfirmed_buys', None):
+        for stock in list(g.intraday_unconfirmed_buys):
+            hist = get_bars(stock, count=1, unit='1d', fields=['open', 'close'], include_now=True)
+            # 若今日收盘价格低于开盘价格，则认为盘中未获确认，次日开盘以市价清仓
+            today_open = hist['open'][-1]
+            today_close = hist['close'][-1]
+            if today_close < today_open:
+                g.next_open_forced_sell.add(stock)
+                log.warn(f"📝 盘后判定：{stock} 今日收盘 {today_close:.2f} 低于开盘 {today_open:.2f}，次日开盘将强制市价清仓(因盘中买入未获确认)。")
+        
+        # 当天的盘后审计完成后，必须清空该集合，避免影响次日逻辑
+        g.intraday_unconfirmed_buys.clear()
