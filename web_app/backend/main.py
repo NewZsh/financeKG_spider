@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from .api import config, graph, qxb, stock, tasks, tyc
+from .api import config, graph, qxb, stock, tasks, tyc, ta
 from .services.background_tasks import start_background_tasks
 import os
 
@@ -28,6 +28,7 @@ app.include_router(config.router)
 app.include_router(qxb.router)
 app.include_router(graph.router, prefix="/api/graph", tags=["graph"])
 app.include_router(stock.router, prefix="/api/stock", tags=["stock"])
+app.include_router(ta.router, prefix="/api/ta", tags=["ta"])
 
 # serve built frontend if exists
 frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'frontend', 'dist'))

@@ -1,0 +1,1082 @@
+# -*- coding: utf-8 -*-
+"""
+策略名称：
+全主板"安全背驰买点"缠论分钟频策略 (s3)  —— v3.3 三硬伤修复版
+
+======================================================================
+〇·AAA、v3.3 修改清单（相对 v3.2）—— 修复 review 指出的三处逻辑硬伤
+======================================================================
+【硬伤1. 利润回撤黑洞 → 新增"移动止盈利润棘轮"】
+    v3.2 的止盈唯一出口 = "30分钟顶背驰 + 现价>中枢ZG"，条件很严；
+    而全部止损（刚性/结构）都锚定在【成本价下方】。后果：一只票浮盈
+    +30% 后若凑不齐严格卖点（如缓慢阴跌、无新高背驰结构），利润无人
+    看守，一路回吐到成本下方的止损线才离场——"盈利单坐电梯"。
+    v3.3 新增利润棘轮（trailing）：
+      - 持仓期间维护最高价水位 g.high_watermark_dict（仅用已发生的
+        盘中现价更新，无未来函数）；
+      - 浮盈曾达 TRAIL_ACTIVATE_RATIO(10%) 即激活保护；
+      - 激活后现价从最高水位回撤 ≥ TRAIL_DRAWDOWN_RATIO(8%) → 止盈
+        离场。（例：最高+10%回撤8%≈保本出，最高+30%≈锁住+19.6%）
+      背驰卖点仍是首选出口（更早、更精确），棘轮只是"利润的最后防线"。
+
+【硬伤2. 结构止损被刚性止损架空 → 止损体系重构】
+    v3.2 的结构止损位取"30分信号笔低点 与 日线信号笔低点 的较低者"。
+    日线笔低点距买入价常有 10%~20%，远低于 -5% 刚性线 → 刚性止损
+    永远先触发，结构止损沦为死代码；且 -5% 刚性砍在结构位之前，等于
+    v3.0 修掉的"止损与入场方向打架"换了个形式回归（背驰反转还没
+    走出来就被固定百分比扫出）。v3.3 重构为：
+      a) 结构止损位只用【30分钟信号笔低点】（不再并入日线笔低点）；
+      b) 新增入场前风险过滤 MAX_STOP_DISTANCE(5%)：若结构止损触发价
+         距买入价超过 5% → 该笔交易风险过大，直接放弃信号（止损太远
+         的交易不做，从源头保证"结构止损永远先于刚性止损触发"）；
+      c) 刚性止损放宽 -5% → -8%，降级为纯灾难兜底（隔夜跳空/极端
+         行情），正常破位一律由结构止损（≤5%+1%缓冲）先行处理。
+    三层出口自此各司其职：背驰卖点(利润最大化) > 利润棘轮(保盈利)
+    > 结构止损(证伪离场) > -8%刚性(灾难兜底)。
+
+【硬伤3. 中枢过滤 fail-open → 买入端改为 fail-closed】
+    v3.2 买入端写的是 `if zg is not None and close > zg: 拒绝`——
+    当 zg 为 None（没形成中枢 / 中枢已过期=走势不明）时【无条件放行】。
+    "不追中枢上方"这道安全闸在最需要它的场景（无结构参照的单边行情、
+    长期无中枢的乱走势）反而完全失效。v3.3 改为 fail-closed：
+      - 买入端（日线确认 + 30分入场）：无有效中枢 → 直接拒绝
+        （看不清结构就不买，宁可错过）；
+      - 卖出端（止盈）保持 fail-open：无中枢时只要顶背驰即可止盈
+        （出口从宽是安全方向，且已有棘轮兜底）——不对称设计是有意的。
+
+======================================================================
+〇·AA、v3.2 修改清单（相对 v3.1）
+======================================================================
+本版按实盘/回测的三点反馈 + review 遗留细节做收口：
+
+【1. 修复"等权分配失效" → 改为账户总资产比例仓位】
+    v3.1 的买入用 cash_per_stock = buy_budget / len(triggered)。问题：
+    同一个30分钟收盘时刻，多只股票"同时"成立背驰买点的概率极低，
+    triggered 几乎恒为 1 → 等权退化成"把留足30%现金后的全部预算
+    砸给这唯一一只"，再被绝对值 MAX_TRADE_VALUE=10万 截断。
+    后果：账户越小，单只占比越离谱（如20万账户，留30%后14万全给
+    一只 → 单票 50%+ 仓位，完全没有分散）。
+    v3.2 改为【固定比例仓位】：单只建仓市值上限 = 账户总资产 ×
+    PER_STOCK_MAX_RATIO（默认0.20），并对当批触发的每只逐单实时
+    重算剩余可用预算（始终留30%现金），既保证分散，也让后续
+    30分钟时刻/后续交易日仍有钱继续买（改善资金闲置）。
+    MAX_TRADE_VALUE 退居为"单笔分单抗冲击阈值"，不再充当仓位上限。
+
+【2. 移除"沪深300 < 60日线不买"大盘闸】
+    该闸与"买入已看月线多头(第2闸)"在大势维度部分重叠，且属于
+    择时性质的系统性开关。按需求移除：initialize / before_market_open /
+    盘中买入 三处的 g.is_market_safe 逻辑全部删除。
+    注：熔断(连亏5次冻结8天)与黑名单/结构止损等风控保留不变。
+
+【3. 黑名单区分盈亏（止盈不再长期误杀二次买点）】
+    v3.1 卖出后一律黑名单5天，会把"止盈出场后回踩再出二次背驰买点"
+    的强势票也封5天而错过。v3.2 改为：亏损出场黑 BLACKLIST_LOSS_DAYS
+    (5天)，止盈出场只黑 BLACKLIST_PROFIT_DAYS(2天)。
+    blacklist_dict 值改存 (加入日期, 冷静天数)。
+
+【4. review 遗留细节收口】
+    - 资金利用：逐单实时重算预算(见第1条)，避免"只触发1只时预算
+      被一次性吃光/截断、后续不再补"。
+    - 陈旧中枢：ZS_MAX_AGE 时效过滤已在 detect_beichi_signal 生效。
+    - 熔断死代码：连亏5次熔断检查已真正启用(v3.0起)。
+
+======================================================================
+〇·A、v3.1 修复：预筛"山腰陷阱"（长窗口位置过滤）
+======================================================================
+v3.0 的第1闸预筛只要求"近5日回踩到30日低点区域"。漏洞：若大拉升
+发生在 30 日窗口之外（例：两个月前 10→30 元，之后 25~30 横盘），
+则"30日低点"本身就悬在山腰平台（25元），回踩到它依旧是 +150% 的
+高位接货——很可能正是主力出货区。
+v3.1 在第1闸叠加【长窗口位置过滤】：
+    现价在 120 日高低区间中的分位 = (现价-120日低)/(120日高-120日低)
+    必须 ≤ 0.60（LONG_POS_MAX），否则视为仍在山腰/高位，拒绝入池。
+取数窗口顺势从 30 根拉到 120 根（仍是单次廉价请求，两检查共用）。
+"回踩"锚定短窗口（30日），"位置"锚定长窗口（120日），二者叠加
+才构成完整的"拒绝追高"：既要回踩下来，也要本来就处在半年区间的
+中下部。
+
+======================================================================
+〇、v3.0 版本说明（相对 v2.0 的修复清单）
+======================================================================
+本版按策略 review 的问题清单做了 5 处关键修复：
+
+【P0-1 修复：止损与入场逻辑打架】
+    v2.0 沿用 s1 的"均线止损"（跌破MA20 / MA20>MA5或MA10 转弱即卖）。
+    但本策略入场 = 30分钟底背驰 = 买在"价格刚回调下来"的位置，
+    此时日线 MA5 往往已拐头贴近 MA20 → 买入次日就被均线止损扫地出门，
+    持仓周期被压到 1~2 天，背驰反转来不及走出来，变成高换手磨损机。
+    v3.0 改为【结构止损】——买回调策略的正确止损方式：
+        a) 刚性止损：亏损 ≥ 5% 清仓（保留，兜底）；
+        b) 结构止损：现价跌破"买点信号笔的低点"（即背驰那一笔创出的
+           新低）再留 1% 缓冲 → 背驰假设被证伪，立即离场。
+        均线类止损全部移除（与买回调的方向天然矛盾）。
+    结构止损在每个30分钟收盘时刻 + 14:57 都会检查（比 v2.0 只在
+    14:57 查更快响应盘中破位，部分缓解 T+1 隔夜跳空的敞口）。
+
+【P0-2 修复：回测性能不可运行】
+    v2.0 候选池上限 300 只 × 每日 7 个30分钟时刻全量缠论 ≈ 2100 次
+    30分钟K线请求/日，分钟回测必然超时。
+    v3.0：候选池上限降到 40 只；且盘前先用"日线级别买点确认"
+    （见 P1）把候选池压到极小，盘中扫描量 ≤ 40×7=280 次/日，可运行。
+
+【P1 修复：级别错配 → 多级别联立】
+    v2.0 直接拿 30分钟背驰当决策级别，一天噪声信号极多。
+    v3.0 恢复缠论正统的"多级别联立"：
+        月线定势(多头) → 日线定买点(日线底背驰近5日内成立+中枢下方)
+        → 30分钟定入场(30分钟底背驰触发才扣扳机)。
+    日线买点确认放在盘前（每日一次重计算），30分钟仅做精确入场。
+
+【P1 修复：信号新鲜度过严】
+    INTRADAY_FRESH_BARS 2 → 3（分型需右侧确认，笔端点天然滞后一根，
+    =2 时绝大多数有效背驰因"确认晚一根"被拒）。
+
+【P2 修复：熔断死代码 / 陈旧中枢】
+    a) 连亏5次熔断的检查代码正式启用（v2.0 中设置计数却注释了检查，
+       计数器空转并不真正停手）；
+    b) 中枢时效过滤：最近一个中枢若"太老"（终点距今超过 ZS_MAX_AGE
+       根K线），不再拿它做位置过滤（陈旧区间会使 现价vsZG 判断失真）。
+
+======================================================================
+一、策略总纲（多级别联立版）
+======================================================================
+本策略在 s1.py（突破-洗盘-反包策略）的工程框架上，把"买卖信号"替换为
+缠论的【安全背驰买卖点】，仓位管理 / 跌停死磕机制沿用 s1，止损改为
+适配"买回调"的结构止损。
+
+【安全背驰买点】= 三级联立，逐级收敛：
+    第1级·月线定势（盘前）：月收盘 ≥ 月MA10（月线多头）。
+        过滤"下跌趋势中途的反弹背驰"（下跌中继危险买点）。
+    第2级·日线定买点（盘前）：日线级别底背驰在最近 DAILY_FRESH_BARS
+        个交易日内成立，且现价 ≤ 日线最近中枢上沿ZG（不追中枢上方
+        半山腰）。→ 通过者进入当日【监控候选池】（≤40只）。
+    第3级·30分钟定入场（盘中）：候选池个股在30分钟级别出现底背驰
+        （最近 INTRADAY_FRESH_BARS 根30分钟K线内成立），且现价 ≤
+        30分钟最近中枢ZG → 立即按【比例仓位】下单买入（单只 ≤ 账户
+        总资产 × PER_STOCK_MAX_RATIO，留 CASH_RESERVE_RATIO 现金）。
+
+【安全背驰卖点】（止盈首选出口）：
+    持仓股 30分钟顶背驰 + (无有效中枢 或 现价 > 30分钟中枢ZG)
+    → 全仓清出。卖出端 fail-open：无中枢时顶背驰即可走（出口从宽）。
+
+【利润棘轮】（v3.3 新增，浮盈的最后防线）：
+    浮盈曾达 TRAIL_ACTIVATE_RATIO(10%) 激活；激活后现价从最高水位
+    回撤 ≥ TRAIL_DRAWDOWN_RATIO(8%) → 止盈离场。
+
+【止损】（每个30分钟收盘时刻 + 14:57 检查，v3.3 重构）：
+    a) 结构：现价 < 30分钟信号笔低点 × (1 - STRUCT_STOP_BUFFER)，
+       且入场前已保证该触发价距买入价 ≤ MAX_STOP_DISTANCE(5%)；
+    b) 刚性：亏损 ≥ 8%（纯灾难兜底：隔夜跳空/极端行情）。
+
+======================================================================
+二、与 s1 保持一致的部分
+======================================================================
+1. 股票池：全主板（过滤 300/301 创业板、688 科创板、8/4 北交所、
+   ST/*ST/退、停牌、上市不足180天）。
+2. 仓位管理（v3.2 调整）：保持30%现金、单股上限=账户总资产×
+   PER_STOCK_MAX_RATIO(比例仓位，替代已失效的"等权分配")、单周期
+   一次、每日最多 MAX_BUYS_PER_DAY 只；单笔按 MAX_TRADE_VALUE 分单抗冲击。
+3. 跌停等特殊情况：开盘跌停挂跌停价死磕 / 补卖池 / 14:57 锁死收复
+   判定 / 15:30 盘后废单审计 —— 完全一致。
+4. 风控善后（v3.2 调整）：黑名单——亏损出场5天/止盈出场2天；
+   连亏5次熔断冻结8日（v3.0 起真正生效）。
+   注：v3.2 已移除"沪深300<60日线不买"的大盘闸。
+
+======================================================================
+三、性能设计（分钟频回测的关键）
+======================================================================
+  - before_market_open（盘前，每日一次，重计算集中在此）：
+      a) 廉价日线预筛（单次120根K线取数，两检查共用）：
+         ① 近 PRESCREEN_RECENT 日回踩到 PRESCREEN_LOW_WINDOW 日低点区域；
+         ② 现价 120 日分位 ≤ LONG_POS_MAX（v3.1 修山腰陷阱）；
+      b) 月线多头过滤（12根月K线）；
+      c) 日线缠论买点确认（250根日K线，最重，放最后、且池满即停）；
+      → 三道闸后进入 g.candidate_pool（上限 MAX_CANDIDATES=40）。
+  - market_intraday（盘中每分钟触发）：
+      * 仅在 30分钟收盘时刻（BAR_30M_TIMES）做重计算：
+          - 持仓：30分钟卖点止盈 + 结构/刚性止损检查；
+          - 候选池（≤40只）：30分钟买点 → 直接买入。
+      * 14:57 及以后：止损终检 + 跌停死磕生死劫。
+
+======================================================================
+四、策略流程 UML
+======================================================================
+```mermaid
+flowchart TD
+    A[盘前] --> B[熔断检查/黑名单/补卖池清理]
+    B --> C[日线廉价预筛: 近5日回踩30日低点 且 现价120日分位≤60%]
+    C --> D{月线在MA10上方?}
+    D -- 否 --> D1[丢弃: 下跌中继危险]
+    D -- 是 --> E{日线底背驰近5日内成立 且 现价≤日线中枢ZG?}
+    E -- 否 --> E1[丢弃: 日线级别买点未确认]
+    E -- 是 --> F[进监控候选池 ≤40只]
+    F --> MO[开盘: 跌停拦截/死磕池挂单/ST清仓]
+    MO --> I[盘中每分钟]
+    I --> T{是30分钟收盘时刻?}
+    T -- 是 --> S1[持仓: 30分顶背驰→止盈 无中枢也可走]
+    S1 --> S0[持仓: 浮盈曾达10%后回撤8%→棘轮止盈]
+    S0 --> S2[持仓: 跌破30分信号笔低点→结构止损 / -8%灾难兜底]
+    S2 --> K[候选池: 30分底背驰+有效中枢下方+止损距离≤5%→买入]
+    I --> O[14:57: 死磕池生死劫 + 止损终检]
+    O --> P[15:30 盘后审计: 废单入补卖池]
+```
+"""
+from jqdata import *
+import numpy as np
+import pandas as pd
+
+# ==================== 全局常量 ====================
+# v3.2：MAX_TRADE_VALUE 由"仓位上限"降级为"单笔分单抗冲击阈值"——
+#   单笔下单金额超过它就拆成多笔，避免大单冲击；真正的单只仓位上限
+#   由下面的 PER_STOCK_MAX_RATIO（按账户总资产比例）决定。
+MAX_TRADE_VALUE = 100000       # 单笔分单抗冲击阈值（元），超过则拆单
+MAX_BUYS_PER_DAY = 5           # 每日最大买入只数
+
+# ---- 仓位管理（v3.2：比例仓位，替代已失效的"等权分配"）----
+# 单只个股建仓市值上限 = 账户总资产 × PER_STOCK_MAX_RATIO。
+#   0.20 = 单只最多占总资产20% → 配合"留30%现金"，最多约3~4只并存，
+#   兼顾分散与单笔有效性。想更分散调小(如0.15)，想更集中调大(如0.25)。
+PER_STOCK_MAX_RATIO = 0.20
+CASH_RESERVE_RATIO = 0.30      # 强制保留现金比例（不动用总资产的30%）
+
+# ---- 黑名单冷静期（v3.2：区分盈亏）----
+BLACKLIST_LOSS_DAYS = 5        # 亏损出场：黑名单 5 天（防割肉后手痒接飞刀）
+BLACKLIST_PROFIT_DAYS = 2      # 止盈出场：只黑 2 天（保留回踩二次背驰买点机会）
+
+# ---- 盘前三道闸参数 ----
+PRESCREEN_LOW_WINDOW = 30      # 日线预筛：回踩到 N 日低点区域
+PRESCREEN_RECENT = 5           # 日线预筛：低点须发生在最近 N 日内
+# v3.1 新增·长窗口位置过滤（修"山腰陷阱"）：
+#   若一只股票在 30 日窗口之外刚经历过大拉升（如两个月前 10→30 元，之后
+#   25~30 横盘），"30日低点"本身就悬在山腰（25元平台）。仅靠"回踩30日
+#   低点"会在 +150% 的高位入池接货。因此再加一道锚定长窗口的位置约束：
+#   现价在 120 日高低区间中的分位 ≤ 60% 才允许入池。
+#   分位 = (现价 - 120日最低) / (120日最高 - 120日最低)
+LONG_POS_WINDOW = 120          # 长窗口位置过滤的观察窗口（约半年）
+LONG_POS_MAX = 0.60            # 现价分位上限：> 0.60 视为仍在山腰/高位，拒绝
+DAILY_FRESH_BARS = 5           # 日线背驰信号新鲜度：须在最近 N 个交易日内成立
+MAX_CANDIDATES = 40            # 监控候选池上限（P0性能修复：300→40）
+BARS_DAY_FOR_CHAN = 250        # 日线缠论分析所用K线根数
+
+# ---- 盘中30分钟入场参数 ----
+BARS_30M_FOR_CHAN = 250        # 30分钟缠论分析所用K线根数（约31个交易日）
+INTRADAY_FRESH_BARS = 3        # 30分钟背驰新鲜度（P1修复：2→3，分型右侧确认天然滞后）
+
+# ---- 止损参数（v3.3 重构：结构止损为主，刚性降级为灾难兜底）----
+# 设计要点：入场前用 MAX_STOP_DISTANCE 保证结构止损触发价距买入价 ≤5%，
+#   刚性线放到 -8% → 正常破位永远是结构止损先触发（修复 v3.2 中
+#   "刚性-5%永远先于10%+外的结构位触发、结构止损沦为死代码"的硬伤）。
+HARD_STOP_RATIO = -0.08        # 刚性止损线：纯灾难兜底（隔夜跳空/极端行情）
+STRUCT_STOP_BUFFER = 0.01      # 结构止损缓冲：跌破信号笔低点 1% 才触发（防插针）
+MAX_STOP_DISTANCE = 0.05       # 入场前风险过滤：结构止损触发价距买入价 >5% 则放弃该信号
+
+# ---- 利润棘轮（v3.3 新增：修"利润回撤黑洞"）----
+# 背驰卖点是首选出口（更早更精确），棘轮是浮盈的最后防线：
+#   浮盈曾达 10% 即激活；激活后现价从最高水位回撤 8% → 止盈离场。
+#   例：最高 +10% 回撤 8% ≈ 保本出；最高 +30% ≈ 锁住 +19.6%。
+TRAIL_ACTIVATE_RATIO = 0.10    # 激活阈值：最高价 ≥ 成本 ×(1+10%)
+TRAIL_DRAWDOWN_RATIO = 0.08    # 触发阈值：现价 ≤ 最高水位 ×(1-8%)
+
+# ---- 中枢时效（P2修复：陈旧中枢不做位置过滤）----
+ZS_MAX_AGE = 60                # 最近中枢终点距今超过 N 根K线视为过期（日线/30分钟通用）
+
+# 30分钟K线收盘时刻（沪深两市）。15:00收盘无法成交，故不纳入；
+# 仅在这些时刻做重量级缠论检测与下单/止损。
+BAR_30M_TIMES = {'10:00', '10:30', '11:00', '11:30', '13:30', '14:00', '14:30'}
+
+
+# ======================================================================
+# 〇、缠论核心算法（自包含，移植自本地 ta_calc.py，纯 numpy/pandas 实现）
+#     —— 与级别无关：喂日线就是日线级别，喂30分钟线就是30分钟级别
+# ======================================================================
+
+def _fractal(high, low):
+    """顶/底分型识别。
+    输入: high/low 为 np.ndarray
+    输出: f 数组, 1=顶分型, -1=底分型, 0=无
+    定义: 第i根K线高低点同时高于左右两根 → 顶分型; 同时低于 → 底分型。
+    注意 range(1, n-1) 不取最后一根 → 分型靠已收盘的右侧K线确认，无未来函数。"""
+    n = len(high)
+    f = np.zeros(n, dtype=int)
+    for i in range(1, n - 1):
+        if high[i] > high[i-1] and high[i] > high[i+1] and low[i] > low[i-1] and low[i] > low[i+1]:
+            f[i] = 1
+        elif low[i] < low[i-1] and low[i] < low[i+1] and high[i] < high[i-1] and high[i] < high[i+1]:
+            f[i] = -1
+    return f
+
+
+def _bi_list(high, low):
+    """缠论"笔"：相邻异性质分型连线，且两分型间至少间隔4根K线。
+    返回 [(start_idx, end_idx, direction, start_price, end_price)]
+    direction: 1=上升笔(底分型→顶分型), -1=下降笔(顶分型→底分型)"""
+    f = _fractal(high, low)
+    pts = [(i, v) for i, v in enumerate(f) if v != 0]
+    bi = []
+    last = None
+    for idx, v in pts:
+        if last is None:
+            last = (idx, v)
+            continue
+        if v == last[1]:
+            # 同性质分型：保留更极端者（顶取更高的、底取更低的）
+            if v == 1:
+                if high[idx] > high[last[0]]:
+                    last = (idx, v)
+            else:
+                if low[idx] < low[last[0]]:
+                    last = (idx, v)
+            continue
+        # 异性质分型：间隔足够则成笔
+        if abs(idx - last[0]) >= 4:
+            sp = low[last[0]] if last[1] == -1 else high[last[0]]
+            ep = high[idx] if v == 1 else low[idx]
+            direction = 1 if last[1] == -1 else -1
+            bi.append((last[0], idx, direction, sp, ep))
+            last = (idx, v)
+        else:
+            last = (idx, v)
+    return bi
+
+
+def _macd_hist(close):
+    """标准 MACD 红绿柱: hist = (DIF - DEA) * 2, 12/26/9 参数。"""
+    close = pd.Series(close)
+    ema_f = close.ewm(span=12, adjust=False).mean()
+    ema_s = close.ewm(span=26, adjust=False).mean()
+    dif = ema_f - ema_s
+    dea = dif.ewm(span=9, adjust=False).mean()
+    return ((dif - dea) * 2).values
+
+
+def _zhongshu_from_bi(bi):
+    """简化中枢：连续3笔的价格区间存在重叠 → 中枢 [ZD, ZG]。
+    返回 [(start_idx, end_idx, ZG, ZD)]，取重叠区间。"""
+    zsl = []
+    i = 0
+    while i + 2 < len(bi):
+        rngs = []
+        for b in bi[i:i+3]:
+            rngs.append((min(b[3], b[4]), max(b[3], b[4])))
+        overlap_low = max(r[0] for r in rngs)
+        overlap_high = min(r[1] for r in rngs)
+        if overlap_high > overlap_low:
+            zsl.append((bi[i][0], bi[i+2][1], overlap_high, overlap_low))
+            i += 2
+        else:
+            i += 1
+    return zsl
+
+
+def detect_beichi_signal(high, low, close, recent_bars=3, zs_max_age=ZS_MAX_AGE):
+    """检测最近是否出现"背驰"信号（缠论一类买卖点候选）。
+    —— 本函数与级别无关，传入哪个周期的K线就是哪个周期的背驰。
+
+    判定逻辑（与本地 ta_calc.bei_chi 一致）：
+      取最近一笔 cur 与上一根同向笔 prev（间隔一笔），
+      - 底背驰(买)：cur 是下降笔, cur 低点 < prev 低点(创新低)，
+        且 cur 区间 |MACD柱面积| < prev 区间 |MACD柱面积|
+      - 顶背驰(卖)：cur 是上升笔, cur 高点 > prev 高点(创新高)，
+        且面积同样缩小
+      信号新鲜度：cur 笔终点必须落在最近 recent_bars 根K线内。
+
+    P2修复·中枢时效：最近中枢的终点若距离现在超过 zs_max_age 根K线，
+      视为"陈旧中枢"，zg/zd 返回 None（不拿过期区间做位置过滤）。
+
+    返回: (signal, last_zg, last_zd, sig_low)
+      signal  : 'buy' / 'sell' / None
+      last_zg : 最近【未过期】中枢上沿（无则 None）
+      last_zd : 最近【未过期】中枢下沿（无则 None）
+      sig_low : 信号笔的极值价（底背驰=新低价, 顶背驰=新高价），
+                买入后作为【结构止损参考位】——跌破它即背驰证伪。"""
+    bi = _bi_list(high, low)
+    if len(bi) < 3:
+        return None, None, None, None
+
+    n = len(close)
+    zsl = _zhongshu_from_bi(bi)
+    last_zg, last_zd = None, None
+    if zsl:
+        zs = zsl[-1]
+        # 中枢时效检查：终点距今 ≤ zs_max_age 根K线才有效
+        if (n - 1 - zs[1]) <= zs_max_age:
+            last_zg, last_zd = zs[2], zs[3]
+
+    hist = _macd_hist(close)
+
+    cur, prev = bi[-1], bi[-3]
+    # 信号必须"新鲜"：最近一笔的终点在最后 recent_bars 根K线内
+    if cur[1] < n - recent_bars:
+        return None, last_zg, last_zd, None
+    if cur[2] != prev[2]:
+        return None, last_zg, last_zd, None
+
+    area_cur = abs(np.nansum(hist[cur[0]:cur[1]+1]))
+    area_prev = abs(np.nansum(hist[prev[0]:prev[1]+1]))
+    if area_prev <= 0:
+        return None, last_zg, last_zd, None
+
+    if cur[2] == -1 and cur[4] < prev[4] and area_cur < area_prev:
+        return 'buy', last_zg, last_zd, cur[4]    # 底背驰, sig_low=信号笔新低
+    if cur[2] == 1 and cur[4] > prev[4] and area_cur < area_prev:
+        return 'sell', last_zg, last_zd, cur[4]   # 顶背驰, sig_low=信号笔新高
+    return None, last_zg, last_zd, None
+
+
+def is_monthly_trend_up(security, context):
+    """月线大势过滤（第1级）：月线收盘 ≥ 月线 MA10 → 视为大级别多头。
+    月线趋势向下时出现的底背驰，多为下跌中继的反弹（危险买点），必须放弃。
+    盘前对候选池预先计算，盘中直接信任（月线日内不变）。"""
+    try:
+        mdf = get_bars(security, count=12, unit='1M', fields=['close'], include_now=True)
+        if mdf is None or len(mdf) < 10:
+            return False   # 数据不足按不安全处理
+        closes = np.asarray(mdf['close'], dtype=float)
+        ma10 = closes[-10:].mean()
+        return closes[-1] >= ma10
+    except Exception as e:
+        log.warn("月线数据获取失败 %s: %s" % (security, e))
+        return False
+
+
+def daily_buy_point_confirmed(security):
+    """日线级别买点确认（第2级，P1修复的核心）：
+    要求日线底背驰在最近 DAILY_FRESH_BARS 个交易日内成立，
+    且最新收盘价 ≤ 日线最近中枢上沿ZG（不在中枢上方半山腰）。
+    通过 → 该股具备"日线级别的一类买点背景"，才允许降级到
+    30分钟找精确入场。这是缠论"多级别联立"的正确用法：
+    大级别定买卖，小级别定买卖点位置。
+    返回: (True/False, day_sig_low)
+    注（v3.3）：day_sig_low 仅存入 candidate_info 备查/日志用，
+    不再并入结构止损位（避免把止损推远、被刚性线架空，见硬伤2）。"""
+    try:
+        bars = get_bars(security, count=BARS_DAY_FOR_CHAN, unit='1d',
+                        fields=['high', 'low', 'close'], include_now=False)
+    except Exception as e:
+        log.warn("日线数据获取失败 %s: %s" % (security, e))
+        return False, None
+    if bars is None or len(bars) < 100:
+        return False, None
+    high = np.asarray(bars['high'], dtype=float)
+    low = np.asarray(bars['low'], dtype=float)
+    close = np.asarray(bars['close'], dtype=float)
+
+    sig, zg, zd, sig_low = detect_beichi_signal(
+        high, low, close, recent_bars=DAILY_FRESH_BARS, zs_max_age=ZS_MAX_AGE)
+    if sig != 'buy':
+        return False, None
+    # 中枢位置过滤（v3.3 改 fail-closed）：必须存在【有效且未过期】的日线
+    # 中枢，且收盘价 ≤ 中枢上沿ZG（中枢内/下方 = 一/二类买点区域）。
+    # 无中枢 = 走势结构不明 → 直接拒绝，宁可错过（旧版 zg=None 时无条件
+    # 放行，"不追中枢上方"这道闸在最需要时反而失效）。
+    if zg is None or close[-1] > zg:
+        return False, None
+    return True, sig_low
+
+
+# ======================================================================
+# 一、下单工具函数（与 s1 完全一致）
+# ======================================================================
+
+def order_buy_once(security, target_value, reference_price):
+    """单次建仓买入（v3.2）：
+    target_value 已由调用方按【比例仓位 + 实时剩余预算】算好，本函数
+    不再自行封顶 MAX_TRADE_VALUE（那已降级为"分单阈值"）；按手取整后
+    交给 order_amount_in_chunks 分单下单以抗大单冲击。返回实际下单股数。"""
+    if reference_price is None or np.isnan(reference_price) or reference_price <= 0:
+        return 0
+    total_amount = int(float(target_value) / reference_price / 100) * 100
+    if total_amount < 100:
+        return 0
+    order_amount_in_chunks(security, total_amount, reference_price)  # 按MAX_TRADE_VALUE分单抗冲击
+    return total_amount
+
+
+def order_amount_in_chunks(security, total_amount, reference_price, is_limit=False):
+    """分单下单：每单金额不超过 MAX_TRADE_VALUE，避免大单冲击；
+    支持限价单（用于跌停死磕挂单）。"""
+    if total_amount == 0:
+        return
+    total_amount = int(total_amount)
+    if total_amount == 0:
+        return
+
+    order_style = LimitOrderStyle(reference_price) if is_limit else None
+
+    if reference_price is None or np.isnan(reference_price) or reference_price <= 0:
+        order(security, total_amount, style=order_style)
+        return
+
+    max_chunk_amount = int(MAX_TRADE_VALUE / reference_price / 100) * 100
+    if max_chunk_amount <= 0:
+        order(security, total_amount, style=order_style)
+        return
+
+    direction = 1 if total_amount > 0 else -1
+    remaining_amount = abs(total_amount)
+    while remaining_amount > 0:
+        if remaining_amount < 100:
+            chunk_amount = remaining_amount
+        else:
+            chunk_amount = min(remaining_amount, max_chunk_amount)
+            # 不足一手的碎股一并打包
+            if (remaining_amount - chunk_amount) > 0 and (remaining_amount - chunk_amount) < 100:
+                chunk_amount = remaining_amount
+        order(security, direction * chunk_amount, style=order_style)
+        remaining_amount -= chunk_amount
+
+
+# ======================================================================
+# 二、框架初始化
+# ======================================================================
+
+def initialize(context):
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    log.info('【缠论安全背驰版 s3 v3.3 · 利润棘轮+止损重构+中枢fail-closed】启动...')
+
+    # 主板标准佣金（最低5元）
+    set_order_cost(OrderCost(close_tax=0.001, open_commission=0.0003,
+                             close_commission=0.0003, min_commission=5), type='stock')
+
+    # ---- 交易状态 ----
+    g.buy_cost_dict = {}            # 个股真实买入成本 {stock: price}
+    g.stop_ref_dict = {}            # 【结构止损参考位】{stock: 30分钟买点信号笔低点}
+    g.high_watermark_dict = {}      # 【利润棘轮】持仓期最高价水位 {stock: price}（v3.3）
+    g.blacklist_dict = {}           # 黑名单 {stock: (加入日期, 冷静天数)}，到期自动移出（v3.2：亏损5天/止盈2天）
+    g.consecutive_loss_count = 0    # 连续亏损计数（熔断用）
+    g.freeze_days_left = 0          # 熔断剩余冻结天数（v3.0 起真正生效）
+    g.position_lock_stocks = set()  # 持仓周期锁：清仓前不允许再次买入
+    g.trailing_stop_last_date = {}  # 个股当日卖出去重 {stock: date}
+    g.today_buy_count = 0           # 当日已买入只数
+    g.frozen_today = False          # 当日是否处于熔断冻结（盘中买入检查用）
+
+    # ---- 监控候选池（盘前三道闸构建：月线多头+日线回踩+日线买点确认）----
+    g.candidate_pool = set()        # {stock, ...}
+    g.candidate_info = {}           # {stock: {'day_sig_low': float}} 日线信号笔低点备查
+
+    # v3.2：已移除"沪深300<60日线不买"大盘闸，不再维护 g.is_market_safe
+
+    # ---- 跌停死磕机制（与 s1 一致）----
+    g.pending_exit_stocks = {}      # {stock: 锁死价} 因跌停未能离场的补卖池
+
+    # 四大定时任务
+    run_daily(before_market_open, time='before_open', reference_security='000300.XSHG')
+    run_daily(market_open, time='open', reference_security='000300.XSHG')
+    run_daily(market_intraday, time='every_bar', reference_security='000300.XSHG')
+    run_daily(after_market_close, time='15:30', reference_security='000300.XSHG')
+
+
+# ======================================================================
+# 三、股票池过滤：全主板（非ST、非创业、非科创、非北交所）
+#     —— 与 s1 完全一致
+# ======================================================================
+
+def get_main_board_pool(context):
+    """动态筛出当天：纯沪深主板 + 非ST + 非停牌 + 上市满180天 的正常股。"""
+    current_date = context.current_dt.date()
+    all_stocks = list(get_all_securities(['stock'], date=current_date).index)
+    current_data = get_current_data()
+
+    main_board_stocks = []
+    for stock in all_stocks:
+        # 过滤创业板(300/301)、科创板(688)、北交所(8/4开头)
+        if stock.startswith('300') or stock.startswith('301') or \
+           stock.startswith('688') or stock.startswith('8') or stock.startswith('4'):
+            continue
+        # 过滤 ST / *ST / 退市
+        if current_data[stock].is_st or 'ST' in current_data[stock].name or '退' in current_data[stock].name:
+            continue
+        # 过滤停牌
+        if current_data[stock].paused:
+            continue
+        # 过滤上市不足180天的次新股
+        info = get_security_info(stock)
+        if info is not None and (current_date - info.start_date).days < 180:
+            continue
+        main_board_stocks.append(stock)
+    return main_board_stocks
+
+
+# ======================================================================
+# 四、盘前：熔断/风控清理 + 三道闸构建"监控候选池"
+#     第1闸: 日线廉价预筛(最便宜, 先砍大头)
+#     第2闸: 月线多头(次便宜)
+#     第3闸: 日线缠论买点确认(最贵, 放最后, 池满即停)
+# ======================================================================
+
+def before_market_open(context):
+    current_date = context.current_dt.date()
+    g.today_buy_count = 0
+    g.frozen_today = False
+    g.candidate_pool = set()
+    g.candidate_info = {}
+
+    # 4.1 策略级熔断（P2修复：v3.0 起真正生效。连亏5次冻结买入8个交易日，
+    #     冻结期内仍正常执行持仓的止盈/止损/死磕，只是不开新仓）
+    if g.freeze_days_left > 0:
+        g.freeze_days_left -= 1
+        g.frozen_today = True
+        log.warn("🧊 策略熔断保护中，剩余 %d 天不开新仓（持仓风控照常）。" % g.freeze_days_left)
+
+    # 4.2 黑名单清理（v3.2：按各自冷静天数到期移出——亏损5天/止盈2天）
+    for stock in list(g.blacklist_dict.keys()):
+        entry = g.blacklist_dict[stock]
+        # 兼容旧格式（若曾存单一日期，按亏损天数处理）
+        if isinstance(entry, tuple):
+            entry_date, ban_days = entry
+        else:
+            entry_date, ban_days = entry, BLACKLIST_LOSS_DAYS
+        if (current_date - entry_date).days > ban_days:
+            del g.blacklist_dict[stock]
+
+    # 4.3 死磕池 / 锁仓 / 去重表 清洗（与 s1 一致）
+    for stock in list(g.pending_exit_stocks.keys()):
+        if stock not in context.portfolio.positions:
+            g.pending_exit_stocks.pop(stock, None)
+    for stock in list(g.position_lock_stocks):
+        if stock not in context.portfolio.positions and stock not in g.pending_exit_stocks:
+            g.position_lock_stocks.discard(stock)
+    for stock in list(g.trailing_stop_last_date.keys()):
+        if stock not in context.portfolio.positions and stock not in g.pending_exit_stocks:
+            g.trailing_stop_last_date.pop(stock, None)
+
+    # 4.4 熔断中 → 今天不会开新仓，直接跳过重量级候选池构建（省回测时间）
+    #     （v3.2 已移除"沪深300<60日线"大盘闸，不再因大盘方向跳过建池）
+    if g.frozen_today:
+        log.info("📋 今日不构建候选池（熔断冻结中）")
+        return
+
+    # 4.5 【三道闸构建监控候选池】
+    main_board_pool = get_main_board_pool(context)
+    checked_heavy = 0   # 第3闸重计算次数统计（日志观察性能用）
+    # 确定性修复：池满即停(break 在 MAX_CANDIDATES)依赖遍历顺序；对
+    # main_board_pool 排序，保证"前 40 只"的选取在不同运行间一致、可复现。
+    for stock in sorted(main_board_pool):
+        if len(g.candidate_pool) >= MAX_CANDIDATES:
+            break
+        if stock in context.portfolio.positions or stock in g.blacklist_dict \
+           or stock in g.position_lock_stocks:
+            continue
+
+        # --- 第1闸·廉价日线预筛（两个检查共用一次 120 根取数）---
+        # 检查①"回踩"：近5日低点须触及30日低点区域（价格必须回踩下来）；
+        # 检查②"位置"（v3.1 修山腰陷阱）：现价在120日高低区间分位 ≤ 60%。
+        #   仅有①时，若大拉升发生在30日窗口之外，"30日低点"本身悬在
+        #   山腰平台上，回踩到它仍是高位接货；②把锚定校准到半年窗口，
+        #   要求现价处于长周期区间的中下部，二者叠加才真正拒绝追高。
+        pre = get_bars(stock, count=LONG_POS_WINDOW, unit='1d',
+                       fields=['high', 'low', 'close'], include_now=False)
+        if pre is None or len(pre) < PRESCREEN_LOW_WINDOW:
+            continue
+        lows_all = np.asarray(pre['low'], dtype=float)
+        highs_all = np.asarray(pre['high'], dtype=float)
+        closes_all = np.asarray(pre['close'], dtype=float)
+
+        # 检查①：近5日回踩到30日低点区域（窗口取最近30根）
+        lows30 = lows_all[-PRESCREEN_LOW_WINDOW:]
+        if np.nanmin(lows30[-PRESCREEN_RECENT:]) > np.nanmin(lows30):
+            continue  # 最近5日没回踩到30日低点区域
+
+        # 检查②：长窗口位置分位 ≤ LONG_POS_MAX（拒绝"30日低点在山腰"的票）
+        # 数据不足120根时用实际长度（次新股已被上市180天过滤，一般够用）
+        lo_120 = np.nanmin(lows_all)
+        hi_120 = np.nanmax(highs_all)
+        rng = hi_120 - lo_120
+        if rng > 1e-6:
+            pos_pct = (closes_all[-1] - lo_120) / rng
+            if pos_pct > LONG_POS_MAX:
+                continue  # 现价仍在半年区间上部 → 前期大拉升的山腰/高位，拒绝
+
+        # --- 第2闸·月线多头过滤（大势安全阀）---
+        if not is_monthly_trend_up(stock, context):
+            continue
+
+        # --- 第3闸·日线缠论买点确认（P1修复核心：日线定买点）---
+        # 只有日线级别底背驰近5日内成立 + 中枢下方，才值得盘中用
+        # 30分钟去找精确入场。这一道闸把候选池压到极小（性能关键）。
+        ok, day_sig_low = daily_buy_point_confirmed(stock)
+        checked_heavy += 1
+        if not ok:
+            continue
+
+        g.candidate_pool.add(stock)
+        g.candidate_info[stock] = {'day_sig_low': day_sig_low}
+
+    log.info("📋 今日监控候选池 %d 只（月多头+日线回踩+日线买点确认；重计算 %d 次）"
+             % (len(g.candidate_pool), checked_heavy))
+
+
+# ======================================================================
+# 五、开盘：跌停拦截 + 死磕池处理 + ST强制清仓（与 s1 完全一致）
+# ======================================================================
+
+def market_open(context):
+    current_data = get_current_data()
+    current_date = context.current_dt.date()
+
+    # 5.1 开盘即跌停的持仓：立即挂跌停价限价单卖出
+    for security in list(context.portfolio.positions.keys()):
+        data = current_data[security]
+        pos = context.portfolio.positions[security]
+        if data.day_open <= data.low_limit:
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+            amount = pos.closeable_amount
+            if amount > 0:
+                log.error("⚠️ [开盘风险拦截] %s 开盘即跌停！挂跌停价限价卖出 %d 股" % (security, amount))
+                order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
+                g.trailing_stop_last_date[security] = current_date
+            # 卖不掉的记录锁死价，进补卖池
+            if security not in g.pending_exit_stocks:
+                g.pending_exit_stocks[security] = data.low_limit
+
+    # 5.2 历史死磕池优先处理
+    if g.pending_exit_stocks:
+        log.warning("🔄 [待补卖池] 检查 %d 只历史锁死标的..." % len(g.pending_exit_stocks))
+        for security in list(g.pending_exit_stocks.keys()):
+            if security not in context.portfolio.positions:
+                g.pending_exit_stocks.pop(security, None)
+                continue
+            data = current_data[security]
+            pos = context.portfolio.positions[security]
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+            if data.day_open <= data.low_limit:
+                amount = pos.closeable_amount
+                if amount > 0:
+                    log.error("🎯 %s 依然跌停开盘，继续挂跌停价死磕，数量 %d" % (security, amount))
+                    order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
+                    g.trailing_stop_last_date[security] = current_date
+            else:
+                log.info("ℹ️ %s 今日已打开跌停，观察至 14:57 决定去留..." % security)
+
+    # 5.3 持仓突变 ST/退 → 开盘强制清仓
+    for security in list(context.portfolio.positions.keys()):
+        if security in g.pending_exit_stocks:
+            continue
+        if current_data[security].is_st or 'ST' in current_data[security].name \
+           or '退' in current_data[security].name:
+            amount = context.portfolio.positions[security].total_amount
+            log.error("⚠️ 持仓 %s 变为ST/退，开盘强制清仓 %d 股" % (security, amount))
+            reference_price = current_data[security].day_open or current_data[security].last_price
+            order_amount_in_chunks(security, -amount, reference_price)
+
+
+# ======================================================================
+# 六、盘中每分钟：30分钟收盘做缠论买卖点+止损 / 14:57 终检+死磕
+# ======================================================================
+
+def market_intraday(context):
+    current_dt = context.current_dt
+    current_date = current_dt.date()
+    current_time = current_dt.strftime('%H:%M')
+    current_data = get_current_data()
+
+    # 6.1 仅在30分钟K线收盘时刻做重量级缠论检测、止损检查与下单
+    if current_time in BAR_30M_TIMES:
+        _check_stop_loss(context, current_data, current_date)      # 先风控
+        _process_30m_signals(context, current_data, current_date)  # 再买卖点
+
+    # 6.2 14:57 及以后：死磕池生死劫 + 止损终检（与 s1 时点一致）
+    if current_time < '14:57':
+        return
+
+    # 死磕池 14:57 生死劫：收复锁死价+MA20 → 留活口；否则限价清仓
+    # （MA20 在这里只用于"跌停股是否恢复持仓"的判定，与止损无关，保留 s1 原样）
+    if g.pending_exit_stocks:
+        for security in list(g.pending_exit_stocks.keys()):
+            if security not in context.portfolio.positions:
+                g.pending_exit_stocks.pop(security, None)
+                continue
+            if g.trailing_stop_last_date.get(security) == current_date:
+                continue
+            data = current_data[security]
+            if data.last_price > data.low_limit:
+                hist_20d = get_bars(security, count=20, unit='1d', fields=['close'], include_now=True)
+                if len(hist_20d) < 20:
+                    continue
+                ma20 = hist_20d['close'].mean()
+                locked_price = g.pending_exit_stocks[security]
+                if data.last_price >= locked_price and data.last_price >= ma20:
+                    log.info("✅ [锁死收复] %s 现价 %.2f 收复锁死价 %.2f 且破 MA20(%.2f)，恢复持仓"
+                             % (security, data.last_price, locked_price, ma20))
+                    g.pending_exit_stocks.pop(security, None)
+                else:
+                    log.error("❌ [锁死未收复] %s 14:57 未收复，限价清仓" % security)
+                    amount = context.portfolio.positions[security].closeable_amount
+                    if amount > 0:
+                        order_amount_in_chunks(security, -amount, data.last_price, is_limit=True)
+                        g.trailing_stop_last_date[security] = current_date
+                    g.pending_exit_stocks.pop(security, None)
+
+    # 止损终检（当日最后一次机会，覆盖 30分钟时刻之间发生的破位）
+    _check_stop_loss(context, current_data, current_date)
+
+
+# ----------------------------------------------------------------------
+# 六·A：止损检查（P0修复核心 —— 结构止损替代均线止损）
+#   设计逻辑：本策略买的是"回调中的背驰反转"，此时均线（MA5/MA10 贴近
+#   或低于 MA20）天然处于"转弱"形态，若沿用 s1 的均线止损，买入次日
+#   就会被扫地出门。买回调的正确止损是【背驰假设证伪】：
+#     - 背驰笔创出的那个新低，是"下跌动能衰竭"的证据锚点；
+#     - 价格若有效跌破该低点（留 STRUCT_STOP_BUFFER 缓冲防插针），
+#       说明下跌动能并未衰竭、背驰失败 → 无条件离场。
+#   v3.3 重构：结构止损为主（入场前 MAX_STOP_DISTANCE 已保证它 ≤5%，
+#   必先于刚性线触发）；刚性 -8% 降级为灾难兜底；并新增【利润棘轮】
+#   （浮盈曾达10%后从最高水位回撤8%即锁利离场，修"利润回撤黑洞"）。
+#   本函数在每个30分钟收盘时刻 + 14:57 各查一次：比 v2.0 只在 14:57
+#   检查响应更快，部分缓解 T+1 新仓的隔夜跳空敞口（T+1 当日新仓
+#   closeable_amount=0 天然跳过，次日起生效）。
+# ----------------------------------------------------------------------
+
+def _check_stop_loss(context, current_data, current_date):
+    current_positions = context.portfolio.positions
+    for security in list(current_positions.keys()):
+        if security in g.pending_exit_stocks:
+            continue
+        if g.trailing_stop_last_date.get(security) == current_date:
+            continue
+        position = current_positions[security]
+        if position.closeable_amount == 0:
+            continue  # T+1：当日新仓无法卖出，次日自动纳入检查
+
+        current_price = current_data[security].last_price if security in current_data else np.nan
+        if np.isnan(current_price) or current_price <= 0:
+            continue
+        # 跌停封死卖不出 → 交给开盘拦截/死磕机制处理
+        if current_price <= current_data[security].low_limit:
+            continue
+
+        my_cost = g.buy_cost_dict.get(security, position.avg_cost)
+        total_pnl_ratio = (current_price - my_cost) / my_cost
+
+        # --- v3.3 利润棘轮·水位更新（只用已发生的盘中现价，无未来函数）---
+        hwm = g.high_watermark_dict.get(security, my_cost)
+        if current_price > hwm:
+            hwm = current_price
+            g.high_watermark_dict[security] = hwm
+
+        should_sell = False
+        reason = ""
+
+        # a) 结构止损（主力止损）：跌破30分钟买点信号笔低点（背驰证伪）。
+        #    入场前已保证触发价距买入价 ≤ MAX_STOP_DISTANCE，故正常破位
+        #    一定是它先于刚性线触发。
+        stop_ref = g.stop_ref_dict.get(security)
+        if stop_ref is not None and current_price < stop_ref * (1.0 - STRUCT_STOP_BUFFER):
+            should_sell = True
+            reason = "跌破信号笔低点 %.2f（背驰证伪·结构止损）" % stop_ref
+        # b) 刚性止损：-8% 纯灾难兜底（隔夜跳空/极端行情/无stop_ref异常态）
+        elif total_pnl_ratio <= HARD_STOP_RATIO:
+            should_sell = True
+            reason = "触及 %.0f%% 刚性止损线（灾难兜底）" % (HARD_STOP_RATIO * 100)
+        # c) 利润棘轮：浮盈曾达激活线后，从最高水位回撤超阈值 → 锁定利润
+        elif hwm >= my_cost * (1.0 + TRAIL_ACTIVATE_RATIO) \
+                and current_price <= hwm * (1.0 - TRAIL_DRAWDOWN_RATIO):
+            should_sell = True
+            reason = "利润棘轮止盈：最高 %.2f(+%.1f%%) 回撤%.0f%%" \
+                     % (hwm, (hwm - my_cost) / my_cost * 100, TRAIL_DRAWDOWN_RATIO * 100)
+
+        if should_sell:
+            log.warn("🚨【风控卖出】%s 原因: %s，当前盈亏 %.2f%%"
+                     % (security, reason, total_pnl_ratio * 100))
+            order_amount_in_chunks(security, -position.closeable_amount, current_price)
+            g.trailing_stop_last_date[security] = current_date
+            _post_exit_cleanup(security, current_date, is_loss=(total_pnl_ratio < 0))
+
+
+# ----------------------------------------------------------------------
+# 六·B：30分钟收盘时刻的缠论买卖点处理器
+#   先扫持仓卖点止盈，再扫候选池买点直接买入。
+#   候选池 ≤40 只（盘前日线买点确认过），单日30分钟重计算 ≤ 40×7=280 次。
+# ----------------------------------------------------------------------
+
+def _process_30m_signals(context, current_data, current_date):
+    # ============ A) 卖点止盈：持仓30分钟顶背驰 + 中枢上方 ============
+    for security in list(context.portfolio.positions.keys()):
+        if security in g.pending_exit_stocks:
+            continue
+        if g.trailing_stop_last_date.get(security) == current_date:
+            continue
+        pos = context.portfolio.positions[security]
+        if pos.closeable_amount == 0:
+            continue
+        try:
+            bars = get_bars(security, count=BARS_30M_FOR_CHAN, unit='30m',
+                            fields=['high', 'low', 'close'], include_now=True)
+        except Exception as e:
+            log.warn("30分钟卖点数据获取失败 %s: %s" % (security, e))
+            continue
+        if bars is None or len(bars) < 60:
+            continue
+        high = np.asarray(bars['high'], dtype=float)
+        low = np.asarray(bars['low'], dtype=float)
+        close = np.asarray(bars['close'], dtype=float)
+
+        sig, zg, zd, _ = detect_beichi_signal(high, low, close,
+                                              recent_bars=INTRADAY_FRESH_BARS)
+        if sig != 'sell':
+            continue
+        # 中枢位置过滤：现价在30分钟【未过期】中枢上方才算"高位止盈"。
+        # 注意（v3.3）：卖出端有意保持 fail-open —— zg=None（无中枢/过期）
+        # 时只要顶背驰成立即放行止盈。出口从宽是安全方向，与买入端的
+        # fail-closed 不对称是设计使然（且利润棘轮已兜底）。
+        if zg is not None and close[-1] <= zg:
+            continue
+
+        current_price = current_data[security].last_price
+        if np.isnan(current_price) or current_price <= 0:
+            continue
+        # 跌停封死卖不出，交给死磕机制
+        if current_price <= current_data[security].low_limit:
+            continue
+        log.warn("💰【30分钟背驰止盈】%s 顶背驰+中枢上方，全仓清出 %d 股 @%.2f"
+                 % (security, pos.closeable_amount, current_price))
+        order_amount_in_chunks(security, -pos.closeable_amount, current_price)
+        g.trailing_stop_last_date[security] = current_date
+        # 善后：止盈属盈利卖出 → 连亏清零、黑名单、清缓存
+        _post_exit_cleanup(security, current_date, is_loss=False)
+
+    # ============ B) 买点买入：候选池30分钟底背驰 + 中枢下方，直接下单 ============
+    # 熔断冻结期不开新仓（P2修复：真正生效）
+    if g.frozen_today:
+        return
+    # v3.2：已移除"沪深300<60日线"大盘闸，不再做指数择时过滤
+    if g.today_buy_count >= MAX_BUYS_PER_DAY:
+        return
+    # 仓位管理：强制保留 CASH_RESERVE_RATIO 现金，其余为可用建仓预算
+    buy_budget = context.portfolio.available_cash \
+                 - context.portfolio.total_value * CASH_RESERVE_RATIO
+    if buy_budget <= 10000:
+        return
+
+    triggered_stocks = []
+    # 确定性修复：candidate_pool 是 set，迭代顺序受 PYTHONHASHSEED 随机化。
+    # 当多只票同刻触发 30 分钟底背驰、break 在 MAX_BUYS_PER_DAY 处截断时，
+    # 随机序会导致每次回测挑中的票不同、资金曲线漂移。sorted 固定按代码序，
+    # 使结果可复现（取舍：同刻超 5 只时取代码字典序最小者，而非随机子集）。
+    for stock in sorted(list(g.candidate_pool)):
+        if g.today_buy_count + len(triggered_stocks) >= MAX_BUYS_PER_DAY:
+            break
+        if stock in g.position_lock_stocks or stock in context.portfolio.positions \
+           or stock in g.blacklist_dict:
+            continue
+
+        try:
+            bars = get_bars(stock, count=BARS_30M_FOR_CHAN, unit='30m',
+                            fields=['high', 'low', 'close'], include_now=True)
+        except Exception as e:
+            log.warn("30分钟买点数据获取失败 %s: %s" % (stock, e))
+            continue
+        if bars is None or len(bars) < 60:
+            continue
+        high = np.asarray(bars['high'], dtype=float)
+        low = np.asarray(bars['low'], dtype=float)
+        close = np.asarray(bars['close'], dtype=float)
+
+        sig, zg, zd, sig_low = detect_beichi_signal(high, low, close,
+                                                    recent_bars=INTRADAY_FRESH_BARS)
+        if sig != 'buy':
+            continue
+        # 中枢位置过滤（v3.3 改 fail-closed）：必须存在【有效且未过期】的
+        # 30分钟中枢，且现价 ≤ 中枢上沿ZG。zg=None（无中枢=结构不明）时
+        # 直接拒绝，宁可错过——旧版此处 fail-open，安全闸形同虚设。
+        if zg is None or close[-1] > zg:
+            continue
+
+        current_price = current_data[stock].last_price
+        if np.isnan(current_price) or current_price <= 0:
+            continue
+        # 涨停不追：现价已封涨停则放弃（买不进且属情绪追高）
+        if current_price >= current_data[stock].high_limit:
+            continue
+
+        # v3.3 入场前风险过滤：结构止损触发价距买入价必须 ≤ MAX_STOP_DISTANCE。
+        #   止损太远的交易不做——既控制单笔最大风险，也从源头保证结构止损
+        #   永远先于 -8% 刚性线触发（否则结构止损沦为死代码）。
+        if sig_low is None:
+            continue
+        struct_trigger = sig_low * (1.0 - STRUCT_STOP_BUFFER)
+        if struct_trigger < current_price * (1.0 - MAX_STOP_DISTANCE):
+            continue  # 结构位距现价 >5%，单笔风险过大，放弃该信号
+
+        triggered_stocks.append((stock, current_price, sig_low))
+
+    # 【比例仓位建仓】（v3.2：替代已失效的"等权分配"）
+    #   单只建仓市值上限 = 账户总资产 × PER_STOCK_MAX_RATIO（固定比例，
+    #   不随当批触发只数变化）；并对每只逐单实时重算剩余预算（始终留
+    #   CASH_RESERVE_RATIO 现金），确保：① 单只不超配；② 后续时刻/后续
+    #   交易日仍有钱继续买（改善资金闲置）。用 spent 本地累计，规避
+    #   available_cash 在同一bar内可能滞后更新的问题。
+    if len(triggered_stocks) > 0:
+        per_stock_cap = context.portfolio.total_value * PER_STOCK_MAX_RATIO
+        spent = 0.0
+        for stock, current_price, sig_low in triggered_stocks:
+            if g.today_buy_count >= MAX_BUYS_PER_DAY:
+                break
+            remaining = buy_budget - spent           # 本批剩余可用预算
+            if remaining <= 10000:
+                break
+            target_value = min(per_stock_cap, remaining)  # 比例上限与剩余预算取小
+            ordered_amount = order_buy_once(stock, target_value, current_price)
+            if ordered_amount >= 100:
+                spent += ordered_amount * current_price
+                # 结构止损参考位（v3.3）：只用【30分钟信号笔低点】。
+                #   不再并入更深的日线笔低点——那会把止损位推到 -10%~-20%，
+                #   被 -8% 刚性线架空成死代码（v3.2 硬伤2）。入场前已通过
+                #   MAX_STOP_DISTANCE 检查，该位距买入价 ≤5%。
+                g.stop_ref_dict[stock] = sig_low
+                g.high_watermark_dict[stock] = current_price  # 利润棘轮水位起点
+                log.info("🛒【30分钟背驰买点·直买】%s 月多头+日线买点+30分底背驰+有效中枢下方，"
+                         "现价 %.2f 买入 %d 股(≈%.0f元/上限%.0f)，结构止损位 %.2f（距价%.1f%%）"
+                         % (stock, current_price, ordered_amount,
+                            ordered_amount * current_price, per_stock_cap,
+                            sig_low, (current_price - sig_low) / current_price * 100))
+                g.buy_cost_dict[stock] = current_price
+                g.position_lock_stocks.add(stock)
+                g.today_buy_count += 1
+                g.candidate_pool.discard(stock)
+
+
+def _post_exit_cleanup(security, current_date, is_loss):
+    """清仓善后：黑名单(v3.2区分盈亏) / 连亏计数与熔断 / 清缓存 / 解锁。"""
+    if is_loss:
+        g.consecutive_loss_count += 1
+        if g.consecutive_loss_count >= 5:
+            g.freeze_days_left = 8
+            g.consecutive_loss_count = 0   # 触发后清零，避免解冻当天立即复触
+            log.error("💥 连续亏损5次，触发熔断，冻结买入8个交易日！")
+        # 亏损出场：黑名单 5 天（防割肉后手痒接飞刀）
+        g.blacklist_dict[security] = (current_date, BLACKLIST_LOSS_DAYS)
+    else:
+        g.consecutive_loss_count = 0
+        # 止盈出场：只黑 2 天（保留回踩再出二次背驰买点的机会，不长期误杀强势股）
+        g.blacklist_dict[security] = (current_date, BLACKLIST_PROFIT_DAYS)
+
+    g.buy_cost_dict.pop(security, None)
+    g.stop_ref_dict.pop(security, None)
+    g.high_watermark_dict.pop(security, None)   # v3.3 利润棘轮水位一并清理
+    g.position_lock_stocks.discard(security)
+
+
+# ======================================================================
+# 七、盘后审计（15:30）：跌停废单拦截（与 s1 完全一致）
+# ======================================================================
+
+def after_market_close(context):
+    """复盘今日全部卖出单，凡因跌停流动性枯竭导致撤单/拒单且仍有实仓的，
+    记录锁死价拖入补卖池，次日开盘继续死磕。"""
+    todays_orders = get_orders()
+    if not todays_orders:
+        return
+    for order_id, order_obj in todays_orders.items():
+        if order_obj.action == 'close':
+            if order_obj.status.name in ['canceled', 'rejected']:
+                security = order_obj.security
+                if security in context.portfolio.positions:
+                    if security not in g.pending_exit_stocks:
+                        current_data = get_current_data()
+                        g.pending_exit_stocks[security] = current_data[security].low_limit
+                        log.error("🚨 [死锁拦截] %s 今日卖出未成交且仍有实仓，"
+                                  "锁死价 %.2f，已入死磕补卖池，明日开盘继续卖出！"
+                                  % (security, current_data[security].low_limit))

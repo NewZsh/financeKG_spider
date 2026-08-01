@@ -260,9 +260,9 @@ def load_bars_with_indicators(code: str, start_date: str, end_date: str) -> pd.D
 
 def format_trade_hover_lines(trades: list[ParsedTrade]) -> str:
     if not trades:
-        return "当日委托: 无"
+        return ""
 
-    lines = []
+    lines = ["当日委托:"]
     for trade in trades:
         price_text = "--" if trade.price is None else f"{trade.price:.2f}"
         line = (
@@ -498,40 +498,15 @@ def api_chart_data():
         abort(404, description=str(exc))
     except LookupError as exc:
         abort(404, description=str(exc))
-    return jsonify(payload)
-
-
-def run_cli_check(log_name: str | None, code: str | None) -> None:
-    summary = build_log_summary(log_name or "")
-    selected_code = code or summary["symbols"][0]["code"]
-    payload = build_chart_payload(summary["log_name"], selected_code)
-    check_result = {
-        "log_name": payload["log_name"],
-        "symbol": payload["symbol_text"],
-        "bar_count": len(payload["dates"]),
-        "trade_count": len(payload["trades"]),
-        "portfolio_net_pnl": payload["portfolio_summary"]["net_pnl"],
-        "symbol_net_pnl": payload["symbol_summary"]["net_pnl"],
-        "db_path": str(DB_PATH),
-    }
-    print(json.dumps(check_result, ensure_ascii=False, indent=2))
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="JoinQuant 策略成交调试看板")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--log", default=None, help="默认日志文件名，例如 1.log")
-    parser.add_argument("--code", default=None, help="用于 --check 的股票代码，例如 000878")
-    parser.add_argument("--check", action="store_true", help="只做日志和数据库联通性校验，不启动服务")
-    return parser
+    return jsonify(payload)    
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
-    if args.check:
-        run_cli_check(args.log, args.code)
-        return
+    parser = argparse.ArgumentParser(description="JoinQuant 策略成交调试看板")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8787)
+
+    args = parser.parse_args()
     app.run(host=args.host, port=args.port, debug=False)
 
 

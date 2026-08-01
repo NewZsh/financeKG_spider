@@ -459,24 +459,13 @@
         yaxis,
         text: markerData.text,
         textposition: 'top center',
-        customdata: markerData.custom,
+        hoverinfo: 'skip',
         marker: {
           size: 11,
           color,
           symbol,
           line: { width: 1, color: 'rgba(29,42,54,0.55)' },
-        },
-        hovertemplate:
-          '<b>%{x}</b><br>' +
-          '时间: %{customdata[0]}<br>' +
-          '方向: %{customdata[1]}<br>' +
-          '数量: %{customdata[2]}股<br>' +
-          '价格: %{customdata[3]}<br>' +
-          '状态: %{customdata[4]}<br>' +
-          '单型: %{customdata[5]}<br>' +
-          '平仓盈亏: %{customdata[6]}<br>' +
-          '手续费: %{customdata[7]}<br>' +
-          '净盈亏: %{customdata[8]}<extra></extra>',
+        }
       };
     }
 
@@ -563,13 +552,7 @@
             'MA5: %{customdata[5]}<br>' +
             'MA10: %{customdata[6]}<br>' +
             'MA20: %{customdata[7]}<br>' +
-            'MA30: %{customdata[8]}<br>' +
-            '当日该股平仓盈亏: %{customdata[9]}<br>' +
-            '当日该股净盈亏: %{customdata[10]}<br>' +
-            '累计该股净盈亏: %{customdata[11]}<br>' +
-            '当日组合净盈亏: %{customdata[12]}<br>' +
-            '累计组合净盈亏: %{customdata[13]}<br>' +
-            '%{customdata[14]}<extra></extra>',
+            'MA30: %{customdata[8]}<extra></extra>',
         },
         {
           type: 'scatter',

@@ -1,125 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 策略名称：
-主板强势股“突破 - 洗盘 - 盘中上破昨开即介入”短线策略
+箱体底部吸筹 + 突破上沿盘中介入短线策略
 
-- 策略目标：只做相对强势、趋势向上的股票，
-1. 由于我不能实盘购买创业板、科创板和北交所，因此先排过滤创业板（300、301）、科创板（688）、北交所（8、4 开头）股票。，只做沪深主板。
+- 策略目标：寻找在箱体底部出现震荡吸筹特征的股票，并在盘中突破箱体上沿时直接买入。
+1. 只做沪深主板，过滤创业板（300、301）、科创板（688）、北交所（8、4 开头）股票。
 2. 过滤 ST、*ST、名称含“退”的股票。
 3. 过滤当日停牌股票。
 4. 过滤上市未满 180 天的新股，避免次新股波动与回测失真。
 
 - before_market_open 盘前选股
-1. 先处理策略级风控：如果此前连续亏损达到熔断条件，则冻结买入若干天。
-2. 清理个股黑名单：黑名单超过 5 天的股票自动恢复可交易。
-3. 清理待补卖池：若某只股票已经不在持仓中，则从 pending_exit_stocks 中移除。
-4. 维护动态观察池 g.watch_pool：
-    - 如果观察池中的某个股票今天突然变成了 ST\*ST\名称含“退”，则直接淘汰。
-    - 每天 age + 1。
-    - age > 15 的股票直接淘汰，说明突破后迟迟未完成反包确认。
-    - 若昨日出现近似主板跌停的极弱阴线，则淘汰。
-    - 若阴线洗盘的成交量超过此前突破阳线最大量，视为主力异常出货，淘汰。
-    - 若阳线继续上涨且放量，则更新 max_raise_vol；若阴线但量能仍健康，则更新 max_drop_vol。
-5. 对全市场主板股票做新一轮突破扫描，候选条件为：
-    - 最近收盘价满足多头排列：close > MA5 > MA10。
-    - 最近一日价格足够强：相对当日开盘涨幅 > 4%，或相对前一日收盘涨幅 > 4%。
-    - 最近一日成交量显著放大：量能 Z-Score > 1.2，且高于前一日成交量。
-6. 满足条件的股票注入观察池，并记录：
-    - breakout_date：突破识别日期。
-    - max_raise_vol：突破阳线阶段观察到的最大阳线量能。
-    - max_drop_vol：洗盘阶段观察到的最大阴线量能。
-    - age：进入观察池后的存续天数。
-7. 观察池最大容量限制为 500 只。
-
-- market_open 开盘风险拦截与补卖处理：
-    - 拦截开盘直接跌停的持仓：若今日开盘即跌停，立即挂跌停价卖单。
-    - 处理历史待补卖池 pending_exit_stocks：
-        - 若依然跌停开盘：继续挂跌停价卖单，“死磕”流动性。
-        - 若已打开跌停：暂不操作，留待 14:57 进行“收复判定”。
+1. 趋势背景判定：20日均线大于60日均线。
+2. 箱体震荡判定：过去 20 天内最高价和最低价的波动振幅小于 15%。
+3. 满足条件的股票记下其箱体上沿（high_max）并加入观察池（age最大为15天）。
 
 - market_intraday 分钟级盘中买卖 & 持仓 
-1. 仓位管理：保持30%现金，如果不足，则不再触发新的买入，等待下一次机会；且单个股票在单次建仓周期内最多只买一次、总买入金额不超过 10w RMB。
-2. 指数趋势过滤：只有在沪深 300 最近收盘仍位于其 60 日均值上方时，才允许盘中继续触发买点。
-3. 买
-    - 盘中每个 bar 都会检查观察池中的候选股，而不是等到 14:57 尾盘确认后再排队到第二天买入。
-    - 只检查观察池中 age >= 1 的股票，即突破当天不买，至少等待一天确认洗盘行为。
-    - 个股满足以下条件即可在当天盘中直接触发买入：
-        - 昨天必须是阴线：确认前一天发生了洗盘。
-        - 今天盘中最新价格必须超过昨天开盘价：视为洗盘后的重新转强。
-        - 必须仍然保持 MA5 > MA10 且 价格未向下脱离突破基准价（必须大于突破日基准价）。
-        - 空间偏离保护：当前触发买入的价格不能超过原始突破基准价的 15%，防止主升浪半山腰高位接盘。
-        - RSI 超买拦截：最近15个交易日的 RSI(14) 不能超过或等于 70，防范短期情绪过度亢奋的赶顶诱多。
-    - 一旦触发买入，策略会按当时可用现金对当批触发股票做等权分配，但单个股票实际买入金额会被限制在 10w 以内。
-    - 每个股票在一次持仓周期内只允许开仓一次；买入后进入持仓锁定状态，直到全部清仓前都不允许再次买入。
-    - 买入后股票会从观察池删除，避免同一天重复触发。
-4. 持仓风控
-    - 规则卖出：对于突然某天变成 ST、*ST、名称含“退”的股票，开盘后立即按市价卖出，当天必须完成清仓。
-    - 对已经进入待补卖池的股票，在 14:57 执行“锁死收复判定”：
-        - 若当前价格同时收复了“锁死价”且突破了 MA20：视为转强，移出补卖池，恢复正常持仓。
-        - 否则：立即市价止损出场，以防再次锁死。
-    - 对普通持仓，策略会计算：
-        - 14:57 附近的盘中价格。
-        - 最近 20 日均线 MA20。
-        - 当前总收益率 total_pnl_ratio。
-        - 历史最高浮盈 max_pnl。
-    - 卖出规则分为三层，都是以14:57价格为基准进行判断，满足条件则当天盘中分单挂单：
-        - 移动止盈：
-            - 若最高浮盈 < 10%，不触发移动止盈，继续持有。
-            - 若最高浮盈在 10% 到 30% 之间，则回撤到最高浮盈的 70% 触发止盈。
-            - 若最高浮盈 > 30%，则回撤到最高浮盈的 60% 触发止盈。
-            - 每次触发移动止盈时，若当前可卖仓位不少于 500 股，则先卖出 1/2；若当前可卖仓位小于 500 股，则直接全部卖出。
-            - 若本次只是部分止盈而非全平，则卖出后保留原始买入成本，但将剩余仓位的“最高浮盈”重新统计。
-            - 移动止盈属于“同日最多一次”的减仓动作，策略强制“个股同日卖出保护”：一旦个股在盘中触发任何卖出（止盈/止损），当日后续分钟 bar 将不再对该股执行任何重复卖出逻辑。
-        - 刚性止损：若亏损达到 5%，触发挂单清仓。
-        - 趋势止损：
-            - 若 14:57 价格跌破 20 日均线，触发挂单清仓。
-            - 若 14:57 发现MA20 > MA5 或者 MA20 > MA10，说明趋势已经转弱，也触发挂单清仓。
-    - 卖出后执行善后：
-        - 个股加入黑名单，避免短期反复踩雷。
-        - 清理买入成本和最高收益缓存。
-        - 若本次属于亏损卖出，则连续亏损计数 +1；否则清零。
-        - 当连续亏损次数达到 5 次时，触发策略熔断，冻结买入 8 个交易日。
-
-- after_market_close 盘后异常审计：复盘今日卖出单，若发现因跌停等原因导致“撤单/拒绝”且仍有持仓，则记录锁定价格并加入待补卖池。
-
-- 策略流程 UML
-```mermaid
-flowchart TD
-    A[盘前启动] --> B{策略是否处于熔断冻结期}
-    B -- 是 --> B1[减少冻结天数并停止当日买入]
-    B -- 否 --> C[清理黑名单与待补卖池]
-    C --> D1{观察池个股是否变为ST/退}
-    D1 -- 是 --> D1a[直接淘汰该标的]
-    D1 -- 否 --> D2[age+1 / 淘汰超龄/跌停/异常砸盘标的]
-    D2 --> D3[更新突破量能及洗盘量能]
-    D1a --> D3
-    D3 --> E[扫描全市场主板突破股]
-    E --> F[满足突破条件则加入观察池]
-    F --> MO[开盘：拦截新跌停股及执行历史跌停股死磕挂单]
-    MO --> G[盘中每分钟执行 market_intraday]
-    G --> H{沪深300趋势是否允许交易}
-    H -- 否 --> H1[停止当日盘中选股]
-    H -- 是 --> I{昨阴线且今价上破昨开且MA5>MA10}
-    I -- 否 --> I1[继续等待或观察池自然淘汰]
-    I -- 是 --> J[当日盘中单次买入且单股不超10w]
-    J --> K[记录买入成本和最高浮盈]
-    K --> L[14:57 检查持仓风控]
-    L --> PS{补卖池是否收复锁死价与MA20}
-    PS -- 是 --> PS1[移出补卖池恢复正常持有]
-    PS -- 否 --> PS2[市价强行清仓]
-    PS1 --> N
-    PS2 --> N
-    L --> N{个股是否满足常规卖出条件}
-    N -- 否 --> O[继续持有]
-    N -- 移动止盈 --> P1[按次/半仓止盈并重置运行状态]
-    P1 --> Q[止盈/止损善后：加黑名单/计亏损/清缓存]
-    N -- 跌破MA20/反向金叉/刚性止损 --> P3[全仓清出]
-    P3 --> Q
-    Q --> R{卖出单是否因跌停失败且仍有实仓}
-    R -- 否 --> S[正常结束]
-    R -- 是 --> T[记录锁死价入补卖池]
-    T --> MO
-```
+1. 买入条件（唯一买入条件）：盘中最新价格突破记录的箱体上缘（high_max）时，即刻触发买入，单股最高限额 10w。
+2. 持仓风控：
+    - 规则卖出：个股突变ST等，开盘强制清仓。跌停死磕补卖机制不变。
+    - 移动止盈（14:57触发验证）：
+        - 浮盈 10%~30% 之间，回撤至最高浮盈 70% 时触发（大于500股先平一半）。
+        - 浮盈 > 30% 时，回撤至最高浮盈 60% 时触发。
+    - 刚性止损：亏损达到 5% 挂单清仓。
+    - 趋势止损：14:57 跌破 20日均线，或者 MA20 > MA5/MA10 时挂单清仓。
+3. 善后防死锁：盘后审计若仍有实仓未走掉的跌停股，转入次日死磕池。
 """
 from jqdata import *
 import numpy as np
@@ -309,63 +213,56 @@ def before_market_open(context):
             continue
             
         # 提取昨日及前日的真实日K线数据
-        hist_1d = get_bars(stock, count=2, unit='1d', fields=['open', 'close', 'volume'], include_now=False)
+        hist_1d = get_bars(stock, count=2, unit='1d', fields=['open', 'close'], include_now=False)
         if hist_1d is not None and len(hist_1d) >= 2:
             t2_close = hist_1d['close'][0] 
-            t1_open, t1_close, t1_vol = hist_1d['open'][1], hist_1d['close'][1], hist_1d['volume'][1] 
+            t1_open, t1_close = hist_1d['open'][1], hist_1d['close'][1]
             
             # 主板跌停限制判定（主板跌幅 >= 9.9% 近似跌停）
             if (t1_close <= t1_open) and ((t1_close / t2_close) <= 0.901):
                 del g.watch_pool[stock]
                 continue
-                
-            # 动态监控砸盘量能
-            if t1_close >= t1_open:
-                if t1_vol > info['max_raise_vol']: 
-                    info['max_raise_vol'] = t1_vol
-            else:
-                # 阴线砸盘量超越了突破大阳线的量，属于主力异常砸盘，直接淘汰
-                if t1_vol > info['max_raise_vol']:
-                    del g.watch_pool[stock]
-                else:
-                    info['max_drop_vol'] = max(info['max_drop_vol'], t1_vol)
 
-    # 3.4 【全市场主板扫描】寻找符合多头突破大阳线的标的注入池子
+    # 3.4 【全市场主板扫描】寻找符合箱体内震荡吸筹的标的注入池子
     main_board_pool = get_main_board_pool(context)
     
     # 限制池子最大承载量，防止内存泄露和过度分散
     if len(g.watch_pool) < 500:
         for stock in main_board_pool:
-            # 已经在观察池或已持仓或在黑名单的，不再重复扫描
             if stock in g.watch_pool or stock in context.portfolio.positions or stock in g.blacklist_dict or stock in g.position_lock_stocks:
                 continue
                 
-            # 批量获取个股历史K线进行技术指标计算
-            df = get_bars(stock, count=40, unit='1d', fields=['open', 'close', 'volume'], include_now=False)
-            if len(df) < 35: continue
+            df = get_bars(stock, count=65, unit='1d', fields=['open', 'close', 'high', 'low', 'volume'], include_now=False)
+            if len(df) < 60: continue
             
-            last_close, last_open, last_vol = df['close'][-1], df['open'][-1], df['volume'][-1]
-            ma5, ma10, ma20 = df['close'][-5:].mean(), df['close'][-10:].mean(), df['close'][-20:].mean()
+            # 转换为 DataFrame 支持 pandas 方法
+            df_pad = pd.DataFrame(df)
             
-            # 计算成交量 Z-Score 爆量系数
-            vol_series = df['volume'][-22:-1]
-            z_score = (last_vol - vol_series.mean()) / vol_series.std() if vol_series.std() > 0 else 0
+            # 趋势背景：20日均线上大于60日均线
+            ma20_curr = df_pad['close'].iloc[-20:].mean()
+            ma60_curr = df_pad['close'].iloc[-60:].mean()
             
-            # 多头排列形态 + 主板放量大阳线(涨幅>4%)
-            is_ma_ok = last_close > ma5 > ma10
-            is_price_ok = (last_close / last_open > 1.04) or (last_close / df['close'][-2] > 1.04) 
-            is_vol_ok = z_score > 1.2 and last_vol > df['volume'][-2]
+            if ma20_curr <= ma60_curr:
+                continue
+                
+            # 1. 箱体震荡判定 (过去 20 天内，最高价和最低价的波动小于 15%)
+            lookback = 20
+            high_max = df_pad['high'].iloc[-lookback:].max()
+            low_min = df_pad['low'].iloc[-lookback:].min()
             
-            if is_ma_ok and is_price_ok and is_vol_ok:
+            if low_min <= 0: continue
+            amplitude = (high_max - low_min) / low_min
+            is_in_box = amplitude < 0.15 
+            
+            if is_in_box:
                 g.watch_pool[stock] = {
                     'breakout_date': current_date,
-                    'max_raise_vol': last_vol,  
-                    'breakout_price': max(last_open, last_close), 
-                    'age': 0,
-                    'max_drop_vol': 0.0  
+                    'high_max': high_max,
+                    'low_min': low_min,
+                    'age': 0
                 }
-                log.info(f"🎯 突破注入主板池 -> {stock} (Z-Score: {z_score:.2f}, 基准价: {g.watch_pool[stock]['breakout_price']:.2f})")
-                if len(g.watch_pool) >= 500: # 控量保护
+                log.info(f"🎯 确认箱体震荡吸筹 -> {stock} (箱体振幅: {amplitude*100:.2f}%, 上沿: {high_max:.2f})")
+                if len(g.watch_pool) >= 500:
                     break
 
     # ====== 新增：盘前预计算缓存，避免盘中每分钟重复请求K线致使系统限流卡死 ======
@@ -501,85 +398,32 @@ def market_intraday(context):
                 if stock in g.position_lock_stocks or stock in context.portfolio.positions:
                     continue
 
-                # 读取昨天的静态截面数据
-                static_info = getattr(g, 'watch_pool_static', {}).get(stock)
-                if not static_info:
-                    continue
-
-                # 提取缓存的数据，t1_open 和 t1_close 是昨天的开盘价和收盘价
-                t1_open = static_info['t1_open']
-                t1_close = static_info['t1_close']
-                
-                # 盘中只需要获取当下的市价即可，不再每次都取几十天前的数据求 MA
+                # 盘中获取当下的市价
                 current_price = current_data[stock].last_price
-                open_price = current_data[stock].day_open
 
                 if np.isnan(current_price) or current_price <= 0:
                     continue
 
-                # 动态计算今日的有效 MA5 / MA10
-                ma5 = (static_info['sum_4'] + current_price) / 5
-                ma10 = (static_info['sum_9'] + current_price) / 10
-
-                # 🛑 检查1：昨天必须是真阴线（确认已发生洗盘）
-                if t1_close >= t1_open:
-                    continue
-
-                # 🛑 检查2：今日开盘价格低于实时价格，且实时价格上破昨日开盘价（反包确认）
-                if current_price < open_price or current_price < t1_open:
-                    continue
-                
-                # 🛑 检查3：价格区间重合校验。今日价格须大于突破日基准价（突破日开/收最大值）
-                # 确保反包发生在多头有效范围内，而不是在深跌后的无效反弹
-                breakout_ref = info.get('breakout_price', 0)
-                if current_price < breakout_ref:
-                    continue
-                
-                # 🛑 检查4：趋势保鲜校验。买入时刻至少维持 MA5 > MA10
-                if not (ma5 > ma10):
+                # 🛑 检查：突破箱体上边缘的时候直接买入
+                box_top = info.get('high_max', 0)
+                if current_price <= box_top:
                     continue
 
                 # ==========================
-                # 进入此阶段代表个股形态上已满足“昨阴洗盘+今阳上破昨开+均线多头+未跌破基准”，
-                # 理论上具备基础买入条件，接下来进行防高位接盘校验并输出日志
+                # 进入此阶段代表个股已向上突破箱体上沿，直接触发买入信号。
                 # ==========================
-                
-                # 🛑 检查5：RSI 超买过滤 与 空间偏离保护
-                # 1. 空间偏离：若此时买入价格已超出原始突破价 25% 以上，说明已走主升浪，不再算作回踩承接
-                divergence = (current_price - breakout_ref) / breakout_ref
-                if divergence > 0.25:
-                    log.info(f"🚫 [买入拦截-空间偏离] {stock} 当前价 {current_price:.2f}。偏离原始突破基准价({breakout_ref:.2f})达 {divergence*100:.2f}% (超25%上限)，放弃接盘。")
-                    continue
-                    
-                # 2. RSI 过滤：计算包含今日当前价格的近似 15日 RSI，达到 70 或以上则过滤（严重超买赶顶）
-                today_diff = current_price - t1_close
-                today_gain = max(today_diff, 0)
-                today_loss = max(-today_diff, 0)
-                
-                avg_gain = (static_info.get('gain_sum_14', 0) + today_gain) / 15.0
-                avg_loss = (static_info.get('loss_sum_14', 0) + today_loss) / 15.0
-                
-                if avg_loss == 0:
-                    rsi_15 = 100.0
-                else:
-                    rs = avg_gain / avg_loss
-                    rsi_15 = 100.0 - (100.0 / (1.0 + rs))
-                    
-                if rsi_15 >= 70:
-                    log.info(f"🚫 [买入拦截-RSI超买] {stock} 当前价 {current_price:.2f}。实时近似 RSI(15) 高达 {rsi_15:.2f} (>=70)，存在赶顶诱多可能，放弃接盘。")
-                    continue
 
-                # 若没有被拦截，顺利成为触发买入候选
-                triggered_stocks.append((stock, current_price, t1_open, rsi_15))
+                # 顺利成为触发买入候选
+                triggered_stocks.append((stock, current_price, box_top, 0.0))
 
             if len(triggered_stocks) > 0:
                 cash_per_stock = buy_budget / len(triggered_stocks)
 
-                for stock, current_price, yesterday_open, rsi_15 in triggered_stocks:
+                for stock, current_price, box_top, _ in triggered_stocks:
                     ordered_amount = order_buy_once(stock, cash_per_stock, current_price)
                     if ordered_amount >= 100:
                         est_value = ordered_amount * current_price
-                        log.info(f"🛒【盘中买入触发】{stock} 当前价 {current_price:.2f} 上破昨开 {yesterday_open:.2f} (RSI={rsi_15:.2f})，计划金额: {cash_per_stock:.2f}，实际买入 {ordered_amount} 股。")
+                        log.info(f"🛒【盘中买入触发】{stock} 当前价 {current_price:.2f} 突破箱体上缘 {box_top:.2f}，计划金额: {cash_per_stock:.2f}，实际买入 {ordered_amount} 股。")
                         g.buy_cost_dict[stock] = current_price
                         g.max_pnl_dict[stock] = 0.0
                         g.position_lock_stocks.add(stock)
