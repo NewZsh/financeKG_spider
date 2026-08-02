@@ -315,28 +315,8 @@ TREND_INTRADAY_FRESH = 2          # 30分背驰新鲜度（v2.0 原值，更严�
 TREND_HARD_STOP = -0.05           # -5% 紧止损（v2.0 原值）
 TREND_CASH_RESERVE = 0.0          # 不强留现金（等权近满仓）
 TREND_BLACKLIST_DAYS = 5          # 平铺 5 天黑名单（不分盈亏）
-TREND_PER_STOCK_MAX_RATIO = 0.30  # trend 模式单票上限(总资产×30%，防等权退化全仓1只)
 # trend 模式另有（在分支里体现，无需常量）：不做日线确认第3闸 / 不做120日位置过滤 /
 #   中枢 fail-open / 不用结构止损与利润棘轮(改用 MA20 均线止损) / 不启用熔断。
-
-# ---- v4.1 三分状态：bear 状态参数 + trend 确认缓冲 ----
-REGIME_CONFIRM_DAYS = 3           # trend 须连续 N 日满足条件才切换(防熊市反弹误判)
-REGIME_MA_COMPARE_GAP = 5         # MA60 与 N 日前的 MA60 比较以判断上行/下行(更稳，抗插针)
-# bear(熊市/下行)：沪深300<MA60 且 MA60 下行 → 不开新仓，只管理持仓止盈止损。
-#   2022-2023 熊市反弹段曾因二分判定被误归 trend(满仓进攻)致大回撤；
-#   三分把"下行"独立出来空仓防御，是回撤控制的关键。
-
-# ---- v4.3 永久持仓（深度价值买入并长期持有，不参与止损/止盈/跌停拦截）----
-# 触发条件满足时用固定预算买入后永久锁仓，与 trend/range/bear 策略仓位独立。
-PERM_HOLD_STOCKS = [
-    {'code': '601988.XSHG', 'name': '中国银行', 'metric': 'pb', 'thresh': 0.8, 'budget': 5000},
-    {'code': '600900.XSHG', 'name': '长江电力', 'metric': 'pe', 'thresh': 20, 'budget': 5000},
-]
-PERM_HOLD_CODES = {c['code'] for c in PERM_HOLD_STOCKS}
-
-# ---- 货币ETF现金管理（闲置现金赚隔夜利息，加仓前按需变现）----
-CASH_ETF = '511880.XSHG'        # 华宝添益货币ETF（T+0，年化~2%）
-CASH_ETF_RESERVE = 10000        # 保留至少 1 万元现金应对临时需求
 
 
 # ======================================================================
@@ -604,9 +584,7 @@ def initialize(context):
     g.trailing_stop_last_date = {}  # 个股当日卖出去重 {stock: date}
     g.today_buy_count = 0           # 当日已买入只数
     g.frozen_today = False          # 当日是否处于熔断冻结（盘中买入检查用）
-    g.active_mode = 'range'         # v4：当日市场状态('trend'/'range'/'bear')，盘前由 classify_market_regime 设定
-    g.trend_confirm_count = 0      # v4.1：trend 连续确认计数(防熊市反弹误判)
-    g.perm_hold_done = set()       # v4.3：已完成永久建仓的股票(建仓后不再止损/止盈/重复买入)
+    g.active_mode = 'range'         # v4：当日市场状态('trend'/'range')，盘前由 classify_market_regime 设定
 
     # ---- 监控候选池（盘前构建：range 三道闸 / trend 两道闸）----
     g.candidate_pool = set()        # {stock, ...}
@@ -637,8 +615,6 @@ def get_main_board_pool(context):
 
     main_board_stocks = []
     for stock in all_stocks:
-        if stock == CASH_ETF:
-            continue  # 排除货币ETF，避免被当成股票候选
         # 过滤创业板(300/301)、科创板(688)、北交所(8/4开头)
         if stock.startswith('300') or stock.startswith('301') or \
            stock.startswith('688') or stock.startswith('8') or stock.startswith('4'):
@@ -662,57 +638,25 @@ def get_main_board_pool(context):
 # ======================================================================
 
 def classify_market_regime(context):
-    """v4.2 三分状态·慢进快出：用沪深300判断 trend / range / bear。
-      进入trend(慢进)：价格>MA60 且 MA60上行，连续 REGIME_CONFIRM_DAYS 日确认
-            → 防 2022-2023 熊市反弹段误判为 trend 满仓进攻。
-      维持trend(快出)：一旦 价格<MA20 或 MA20 下行 → 立即退出至 range/bear
-            → 防 2021 年初核心资产见顶时 MA60 滞后仍上行、trend 不退而满仓吃急跌。
-      bear  (熊市/下行)：价格<MA60 且 MA60 下行 → 不开新仓。
-      range (震荡)：其余。
-    设计依据：
-      ① 进出非对称——进入用 MA60(慢、稳，抗反弹插针)，退出用 MA20(快，防见顶滞后)；
-      ② v4.1 用 MA60 判退出(慢进慢出)，2021 见顶时 MA60 仍在上行不退出→满仓吃跌；
-         改用 MA20 做快速退出信号，MA60 严格条件+确认做慢进，兼顾两端。
-      ③ bear 立即生效(下行市快速空仓防御)。"""
+    """v4 市场状态分类：用沪深300判断"趋势多头 vs 弱势震荡"。
+    判定 trend（须同时满足，降低震荡市的反复开关）：
+      ① 沪深300 收盘 > MA60（中期多头）；
+      ② 沪深300 MA20 较前一交易日上行（短期强势）。
+    任一不满足或数据异常 → range（保守，fail-safe）。
+    依据：单一均线在震荡市会反复开关导致状态抖动；双条件叠加更稳。
+    返回 'trend' 或 'range'。"""
     try:
         bars = get_bars(REGIME_INDEX, count=REGIME_TREND_BARS, unit='1d',
                         fields=['close'], include_now=False)
-        if bars is None or len(bars) < REGIME_MA_LONG + REGIME_MA_COMPARE_GAP + 2:
+        if bars is None or len(bars) < REGIME_MA_LONG + 2:
             return 'range'
         closes = np.asarray(bars['close'], dtype=float)
-        ma60_now = closes[-REGIME_MA_LONG:].mean()
-        # N 日前的 MA60(同样60日窗口，整体前移 N 日)
-        ma60_prev = closes[-(REGIME_MA_LONG + REGIME_MA_COMPARE_GAP):-REGIME_MA_COMPARE_GAP].mean()
+        ma60 = closes[-REGIME_MA_LONG:].mean()
         ma20_now = closes[-REGIME_MA_SHORT:].mean()
         ma20_prev = closes[-REGIME_MA_SHORT - 1:-1].mean()
-        price = closes[-1]
-
-        ma60_up = ma60_now > ma60_prev
-        ma60_down = ma60_now < ma60_prev
-        ma20_up = ma20_now > ma20_prev
-
-        trend_enter = (price > ma60_now) and ma60_up   # 严格进入：中期多头+中期上行
-        trend_stay = (price > ma20_now) and ma20_up    # 宽松维持：短期多头+短期上行(失效即快出)
-        bear_cond = (price < ma60_now) and ma60_down
-
-        if g.active_mode == 'trend':
-            # 已在 trend：维持条件不满足 → 立即退出(快出，防见顶满仓吃跌)
-            if not trend_stay:
-                g.trend_confirm_count = 0
-                return 'bear' if bear_cond else 'range'
-            return 'trend'
-        else:
-            # 不在 trend：严格条件+连续确认才进入(慢进，防熊市反弹误判)
-            if trend_enter:
-                g.trend_confirm_count += 1
-            else:
-                g.trend_confirm_count = 0
-            if g.trend_confirm_count >= REGIME_CONFIRM_DAYS:
-                return 'trend'
-            elif bear_cond:
-                return 'bear'
-            else:
-                return 'range'
+        cond_mid = closes[-1] > ma60          # 中期多头
+        cond_short = ma20_now > ma20_prev     # 短期上行
+        return 'trend' if (cond_mid and cond_short) else 'range'
     except Exception as e:
         log.warn("大盘状态判断失败，按 range 处理: %s" % e)
         return 'range'
@@ -732,18 +676,16 @@ def before_market_open(context):
     g.candidate_pool = set()
     g.candidate_info = {}
 
-    # v4.1：盘前先判市场状态(三分：trend/range/bear)
+    # v4：盘前先判市场状态，决定当日用 trend / range 哪套参数
     g.active_mode = classify_market_regime(context)
     is_trend = (g.active_mode == 'trend')
-    mode_desc = {'trend': '趋势多头(trend)→V2进攻风格', 'range': '弱势震荡(range)→V3.3防御风格',
-                 'bear': '熊市下行(bear)→不开新仓'}[g.active_mode]
-    log.info("🌐 今日市场状态: %s" % mode_desc)
+    log.info("🌐 今日市场状态: %s" % ("趋势多头(trend)→V2风格" if is_trend else "弱势震荡(range)→V3.3风格"))
 
     # 4.1 策略级熔断（P2修复：v3.0 起真正生效。连亏5次冻结买入8个交易日，
     #     冻结期内仍正常执行持仓的止盈/止损/死磕，只是不开新仓）
-    # v4.1：仅 range 模式启用熔断；trend/bear 不冻结(trend连亏多为系统回调；bear本就不开新仓)。
-    if g.active_mode != 'range':
-        g.freeze_days_left = 0       # 非range态强制不冻结
+    # v4：仅 range 模式启用熔断；trend 模式(趋势市)连亏多为系统回调，冻结会错过反弹，故不启用。
+    if is_trend:
+        g.freeze_days_left = 0       # 趋势态强制不冻结
     elif g.freeze_days_left > 0:
         g.freeze_days_left -= 1
         g.frozen_today = True
@@ -775,10 +717,6 @@ def before_market_open(context):
     #     （v3.2 已移除"沪深300<60日线"大盘闸，不再因大盘方向跳过建池）
     if g.frozen_today:
         log.info("📋 今日不构建候选池（熔断冻结中）")
-        return
-    # v4.1：bear(熊市下行)状态不开新仓，跳过候选池构建（持仓止盈止损照常由盘中 _check_stop_loss 处理）
-    if g.active_mode == 'bear':
-        log.info("🐻 熊市状态，今日不开新仓（持仓风控照常）")
         return
 
     # 4.5 【构建监控候选池】v4：trend 两道闸(回踩+月多头, 上限300) / range 三道闸(+日线确认+120日位置, 上限40)
@@ -851,67 +789,12 @@ def before_market_open(context):
 # 五、开盘：跌停拦截 + 死磕池处理 + ST强制清仓（与 s1 完全一致）
 # ======================================================================
 
-def check_perm_hold(context, current_data):
-    """v4.3 永久持仓检查：深度价值条件(PB/PE)满足则用固定预算买入并永久持有。
-    永久持仓不参与止损/止盈/开盘跌停拦截——建仓后锁仓不动，与策略仓位独立。"""
-    todo = [c for c in PERM_HOLD_STOCKS if c['code'] not in g.perm_hold_done]
-    if not todo:
-        return
-    codes = [c['code'] for c in todo]
-    try:
-        df = get_fundamentals(query(valuation.code, valuation.pe_ratio, valuation.pb_ratio)
-                              .filter(valuation.code.in_(codes)))
-    except Exception as e:
-        log.warn("永久持仓估值查询失败: %s" % e)
-        return
-    if df is None or len(df) == 0:
-        return
-    val_map = {row['code']: (row['pe_ratio'], row['pb_ratio']) for _, row in df.iterrows()}
-    for cfg in todo:
-        code = cfg['code']
-        if code in context.portfolio.positions or code in g.perm_hold_done:
-            g.perm_hold_done.add(code)   # 已持仓视为完成
-            continue
-        if code not in val_map:
-            continue
-        pe, pb = val_map[code]
-        pe = float(pe) if pe else 0.0
-        pb = float(pb) if pb else 0.0
-        if cfg['metric'] == 'pb':
-            hit = pb > 0 and pb < cfg['thresh']
-            cur_val = pb
-        else:
-            hit = pe > 0 and pe < cfg['thresh']
-            cur_val = pe
-        if not hit:
-            continue
-        price = current_data[code].last_price if code in current_data else 0.0
-        if price <= 0 or (isinstance(price, float) and np.isnan(price)):
-            continue
-        if price >= current_data[code].high_limit:
-            continue   # 涨停不追
-        ordered = order_buy_once(code, cfg['budget'], price)
-        if ordered >= 100:
-            g.perm_hold_done.add(code)
-            g.buy_cost_dict[code] = price
-            log.info("💎【永久持仓·深度价值买入】%s %s=%.2f < %.2f，买入 %d 股(≈%.0f元)，永久持有"
-                     % (cfg['name'], cfg['metric'].upper(), cur_val, cfg['thresh'],
-                        ordered, ordered * price))
-
-
 def market_open(context):
     current_data = get_current_data()
     current_date = context.current_dt.date()
 
-    # v4.3 永久持仓检查（深度价值买入，与策略仓位独立）
-    check_perm_hold(context, current_data)
-
-    # 5.1 开盘即跌停的持仓：立即挂跌停价限价单卖出（永久持仓股跳过）
+    # 5.1 开盘即跌停的持仓：立即挂跌停价限价单卖出
     for security in list(context.portfolio.positions.keys()):
-        if security == CASH_ETF:
-            continue   # 货币ETF不参与持仓风控
-        if security in g.perm_hold_done:
-            continue   # 永久持仓不卖出
         data = current_data[security]
         pos = context.portfolio.positions[security]
         if data.day_open <= data.low_limit:
@@ -948,8 +831,6 @@ def market_open(context):
 
     # 5.3 持仓突变 ST/退 → 开盘强制清仓
     for security in list(context.portfolio.positions.keys()):
-        if security == CASH_ETF:
-            continue   # 货币ETF不参与持仓风控
         if security in g.pending_exit_stocks:
             continue
         if current_data[security].is_st or 'ST' in current_data[security].name \
@@ -1055,10 +936,6 @@ def _ma_stop_triggered(security, current_price, total_pnl_ratio):
 def _check_stop_loss(context, current_data, current_date):
     current_positions = context.portfolio.positions
     for security in list(current_positions.keys()):
-        if security == CASH_ETF:
-            continue   # 货币ETF不参与止损
-        if security in g.perm_hold_done:
-            continue   # v4.3 永久持仓不参与止损
         if security in g.pending_exit_stocks:
             continue
         if g.trailing_stop_last_date.get(security) == current_date:
@@ -1131,10 +1008,6 @@ def _check_stop_loss(context, current_data, current_date):
 def _process_30m_signals(context, current_data, current_date):
     # ============ A) 卖点止盈：持仓30分钟顶背驰 + 中枢上方 ============
     for security in list(context.portfolio.positions.keys()):
-        if security == CASH_ETF:
-            continue   # 货币ETF不止盈/不卖出
-        if security in g.perm_hold_done:
-            continue   # v4.3 永久持仓不止盈
         if security in g.pending_exit_stocks:
             continue
         if g.trailing_stop_last_date.get(security) == current_date:
@@ -1183,20 +1056,12 @@ def _process_30m_signals(context, current_data, current_date):
     # 熔断冻结期不开新仓（P2修复：真正生效）
     if g.frozen_today:
         return
-    # v4.1：bear(熊市下行)状态不开新仓
-    if g.active_mode == 'bear':
-        return
+    # v3.2：已移除"沪深300<60日线"大盘闸，不再做指数择时过滤
     if g.today_buy_count >= MAX_BUYS_PER_DAY:
         return
     # 仓位管理：v4 trend 模式等权近满仓(不留现金)；range 模式留 CASH_RESERVE_RATIO 现金
     cash_reserve = TREND_CASH_RESERVE if g.active_mode == 'trend' else CASH_RESERVE_RATIO
-    # 货币ETF市值并入预算，避免"现金全在511880→可用现金偏低→误判无钱→永不变现永不买"死锁
-    etf_pos = context.portfolio.positions.get(CASH_ETF)
-    etf_value = 0.0
-    if etf_pos is not None and etf_pos.closeable_amount > 0:
-        ep = current_data[CASH_ETF].last_price if CASH_ETF in current_data else 0.0
-        etf_value = etf_pos.closeable_amount * ep
-    buy_budget = context.portfolio.available_cash + etf_value \
+    buy_budget = context.portfolio.available_cash \
                  - context.portfolio.total_value * cash_reserve
     if buy_budget <= 10000:
         return
@@ -1261,15 +1126,11 @@ def _process_30m_signals(context, current_data, current_date):
     # 【建仓】v4：trend 模式等权(budget/n，封顶 MAX_TRADE_VALUE 分单) / range 模式比例仓位(总资产×PER_STOCK_MAX_RATIO)
     #   用 spent 本地累计，规避 available_cash 在同一bar内可能滞后更新。
     if len(triggered_stocks) > 0:
-        # 确有加仓目标 → 加仓前变现货币ETF（按需，避免无信号日白白损失隔夜利息）
-        _redeem_cash_etf(context)
         is_trend = (g.active_mode == 'trend')
         n = len(triggered_stocks)
-        # trend 等权：当批预算均分，但单票不超总资产×TREND_PER_STOCK_MAX_RATIO(防退化1只时全仓)；
+        # trend 等权：当批预算均分(退化1只时全给，封顶MAX_TRADE_VALUE分单)；
         # range 比例：单只上限=总资产×PER_STOCK_MAX_RATIO，逐单实时重算剩余(始终留30%现金)。
-        trend_eq = buy_budget / n
-        trend_cap = context.portfolio.total_value * TREND_PER_STOCK_MAX_RATIO
-        per_stock_cap = min(trend_eq, trend_cap) if is_trend \
+        per_stock_cap = (buy_budget / n) if is_trend \
                         else (context.portfolio.total_value * PER_STOCK_MAX_RATIO)
         spent = 0.0
         for stock, current_price, sig_low in triggered_stocks:
@@ -1306,8 +1167,8 @@ def _post_exit_cleanup(security, current_date, is_loss):
     """清仓善后：黑名单(v3.2区分盈亏) / 连亏计数与熔断 / 清缓存 / 解锁。"""
     if is_loss:
         g.consecutive_loss_count += 1
-        # v4.1：仅 range 模式启用熔断；trend/bear 不冻结(trend连亏多为系统回调；bear本就不开新仓)。
-        if g.active_mode == 'range' and g.consecutive_loss_count >= 5:
+        # v4：仅 range 模式启用熔断；trend 模式连亏多为系统回调，冻结会错过反弹。
+        if g.active_mode != 'trend' and g.consecutive_loss_count >= 5:
             g.freeze_days_left = 8
             g.consecutive_loss_count = 0   # 触发后清零，避免解冻当天立即复触
             log.error("💥 连续亏损5次，触发熔断，冻结买入8个交易日！")
@@ -1330,55 +1191,20 @@ def _post_exit_cleanup(security, current_date, is_loss):
 # 七、盘后审计（15:30）：跌停废单拦截（与 s1 完全一致）
 # ======================================================================
 
-def _redeem_cash_etf(context):
-    """加仓前变现：把持有的货币ETF(511880)全部转为可用现金，供建仓使用。
-    非无条件每日变现——仅在确有加仓意图（triggered_stocks 非空）时由
-    _process_30m_signals 调用，避免 bear/无信号日每天白白卖掉损失隔夜利息。"""
-    pos = context.portfolio.positions.get(CASH_ETF)
-    if pos is None or pos.closeable_amount <= 0:
-        return
-    try:
-        order(CASH_ETF, -pos.closeable_amount)   # 清掉货币ETF，现金回到可用
-        log.info("💵 [货币ETF变现] 卖出 511880 %d 份，释放现金用于加仓" % pos.closeable_amount)
-    except Exception as e:
-        log.warn("货币ETF变现失败: %s" % e)
-
-
-def _invest_cash_etf(context, current_data):
-    """盘后现金管理：把闲余现金(available_cash - 保留额)买入 511880 货币ETF赚隔夜利息。
-    货币ETF不参与止损/止盈/跌停拦截；不在 perm_hold 也不在候选池。"""
-    try:
-        avail = context.portfolio.available_cash
-        invest_cash = avail - CASH_ETF_RESERVE
-        if invest_cash < 10000:   # 至少够买一手(约1万元)才做
-            return
-        price = current_data[CASH_ETF].last_price if CASH_ETF in current_data else 0.0
-        if price <= 0:
-            return
-        amount = int(invest_cash / price / 100) * 100
-        if amount < 100:
-            return
-        order(CASH_ETF, amount)
-        log.info("💵 [货币ETF现金管理] 闲余 %.0f 元买入 511880 %d 份(年化~2%%)" % (invest_cash, amount))
-    except Exception as e:
-        log.warn("货币ETF买入失败: %s" % e)
-
-
 def after_market_close(context):
     """复盘今日全部卖出单，凡因跌停流动性枯竭导致撤单/拒单且仍有实仓的，
     记录锁死价拖入补卖池，次日开盘继续死磕。"""
     todays_orders = get_orders()
-    if todays_orders:
-        for order_id, order_obj in todays_orders.items():
-            if order_obj.action == 'close':
-                if order_obj.status.name in ['canceled', 'rejected']:
-                    security = order_obj.security
-                    if security in context.portfolio.positions:
-                        if security not in g.pending_exit_stocks:
-                            current_data = get_current_data()
-                            g.pending_exit_stocks[security] = current_data[security].low_limit
-                            log.error("🚨 [死锁拦截] %s 今日卖出未成交且仍有实仓，"
-                                      "锁死价 %.2f，已入死磕补卖池，明日开盘继续卖出！"
-                                      % (security, current_data[security].low_limit))
-    # 盘后现金管理：闲余现金买入 511880 货币ETF 赚隔夜利息（不参与止损/止盈/跌停拦截）
-    _invest_cash_etf(context, get_current_data())
+    if not todays_orders:
+        return
+    for order_id, order_obj in todays_orders.items():
+        if order_obj.action == 'close':
+            if order_obj.status.name in ['canceled', 'rejected']:
+                security = order_obj.security
+                if security in context.portfolio.positions:
+                    if security not in g.pending_exit_stocks:
+                        current_data = get_current_data()
+                        g.pending_exit_stocks[security] = current_data[security].low_limit
+                        log.error("🚨 [死锁拦截] %s 今日卖出未成交且仍有实仓，"
+                                  "锁死价 %.2f，已入死磕补卖池，明日开盘继续卖出！"
+                                  % (security, current_data[security].low_limit))

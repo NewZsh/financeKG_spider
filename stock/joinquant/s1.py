@@ -10,8 +10,7 @@
 4. 过滤上市未满 180 天的新股，避免次新股波动与回测失真。
 
 - before_market_open 盘前选股
-1. 先处理策略级风控：如果此前连续亏损达到熔断条件，则冻结买入若干天。
-2. 清理个股黑名单：黑名单超过 5 天的股票自动恢复可交易。
+1. 清理个股黑名单：黑名单超过 5 天的股票自动恢复可交易。
 3. 清理待补卖池：若某只股票已经不在持仓中，则从 pending_exit_stocks 中移除。
 4. 维护动态观察池 g.watch_pool：
     - 如果观察池中的某个股票今天突然变成了 ST\*ST\名称含“退”，则直接淘汰。
@@ -76,18 +75,14 @@
             - 若 14:57 发现MA20 > MA5 或者 MA20 > MA10，说明趋势已经转弱，也触发挂单清仓。
     - 卖出后执行善后：
         - 个股加入黑名单，避免短期反复踩雷。
-        - 清理买入成本和最高收益缓存。
-        - 若本次属于亏损卖出，则连续亏损计数 +1；否则清零。
-        - 当连续亏损次数达到 5 次时，触发策略熔断，冻结买入 8 个交易日。
+            - 清理买入成本和最高收益缓存。
 
 - after_market_close 盘后异常审计：复盘今日卖出单，若发现因跌停等原因导致“撤单/拒绝”且仍有持仓，则记录锁定价格并加入待补卖池。
 
 - 策略流程 UML
 ```mermaid
 flowchart TD
-    A[盘前启动] --> B{策略是否处于熔断冻结期}
-    B -- 是 --> B1[减少冻结天数并停止当日买入]
-    B -- 否 --> C[清理黑名单与待补卖池]
+    A[盘前启动] --> C[清理黑名单与待补卖池]
     C --> D1{观察池个股是否变为ST/退}
     D1 -- 是 --> D1a[直接淘汰该标的]
     D1 -- 否 --> D2[age+1 / 淘汰超龄/跌停/异常砸盘标的]
@@ -192,8 +187,6 @@ def initialize(context):
     g.buy_cost_dict = {}          # 记录个股真实买入成本 {stock: price}
     g.max_pnl_dict = {}           # 记录个股持仓最高收益率（用于移动止盈）
     g.blacklist_dict = {}         # 黑名单，防止短期重复踩雷 {stock: delete_date}
-    g.consecutive_loss_count = 0  # 连续亏损计数器
-    g.freeze_days_left = 0        # 策略熔断剩余天数        
 
     g.watch_pool = {}             # 全局动态观察池字典 {stock: {info}}
     g.position_lock_stocks = set() # 已开仓未完全退出的股票，持仓周期内禁止再次买入
@@ -265,13 +258,7 @@ def before_market_open(context):
     current_date = context.current_dt.date()
     g.today_buy_count = 0
 
-    # 3.1 策略整体风控：检查策略级别熔断状态
-    # if g.freeze_days_left > 0:
-    #     g.freeze_days_left -= 1
-    #     log.warn(f"🚨 策略处于整体亏损熔断保护中，剩余 {g.freeze_days_left} 天不进行任何买入。")
-    #     return
-
-    # 3.2 清理黑名单（满5天的个股自动移出黑名单）
+    # 清理黑名单（满5天的个股自动移出黑名单）
     for stock in list(g.blacklist_dict.keys()):
         if (current_date - g.blacklist_dict[stock]).days > 5:
             del g.blacklist_dict[stock]
@@ -714,14 +701,6 @@ def market_intraday(context):
                 g.max_pnl_dict[security] = max(0.0, total_pnl_ratio)
 
             if full_exit:
-                if is_loss:
-                    g.consecutive_loss_count += 1
-                    if g.consecutive_loss_count >= 5:
-                        g.freeze_days_left = 8
-                        log.error("💥💥💥 策略整体连续亏损5次，触发熔断保护，空仓面壁8个交易日！")
-                else:
-                    g.consecutive_loss_count = 0
-
                 g.blacklist_dict[security] = current_date
                 if security in g.buy_cost_dict:
                     del g.buy_cost_dict[security]

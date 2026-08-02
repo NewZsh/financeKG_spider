@@ -1,7 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 策略名称：
-全主板"安全背驰买点"缠论分钟频策略 (s3)  —— v4.0 市场状态自适应版
+全主板"安全背驰买点"缠论分钟频策略 (s3)  —— v5.0 市场状态自适应·进取版
+
+======================================================================
+★ v5.0 核心思想：在 v4 三分状态基础上，把 trend 模式的买点从"底背驰抄底"
+   升级为"缠论二买/三买(顺势)+周线中枢上移"——从"抄底弱势"翻转为"买强势股回调"
+======================================================================
+v4 数据发现：四版本选股全是负 alpha（胜率<50%、平仓全亏），超额只来自熊市避跌。
+"底背驰直买"本质是抄底反转（接弱势股飞刀），在强牛段能跟涨但整体负 edge。
+缠论真正的"进取"工具是二买(回调不破一类低点)与三买(突破后回踩不进中枢)——
+都是已确认强势股的回踩买点。v5 在 trend 模式用这两个顺势信号，并要求候选股
+处于周线"中枢上移"的上升结构（多级别联立），实现"只在强势股的主升回踩上车"。
+  trend 模式：宽入口(2闸+周线中枢上移,上限300) / 等权近满仓 / 30分二买·三买 /
+            结构止损(二买/三买低点) / 利润棘轮 / 不熔断
+  range 模式：严入口(3闸+120日位置,上限40) / 比例轻仓留30%现金 / 30分底背驰 /
+            -8%+结构止损+利润棘轮 / 中枢fail-closed / 启用熔断   （同 v4）
+  bear 模式：不开新仓，只管持仓（同 v4）
+开关 AGGRESSIVE_BUY=False 可整体退化回 v4 行为，便于 A/B 对照。
 
 ======================================================================
 ★ v4.0 核心思想：市场状态自适应（V2 与 V3.3 风格互补，非二选一）
@@ -270,6 +286,7 @@ LONG_POS_MAX = 0.60            # 现价分位上限：> 0.60 视为仍在山腰/
 DAILY_FRESH_BARS = 5           # 日线背驰信号新鲜度：须在最近 N 个交易日内成立
 MAX_CANDIDATES = 40            # 监控候选池上限（P0性能修复：300→40）
 BARS_DAY_FOR_CHAN = 250        # 日线缠论分析所用K线根数
+BARS_WEEK_FOR_CHAN = 120        # 周线缠论分析所用K线根数（约2.3年，足够识别周线中枢上移）
 
 # ---- 盘中30分钟入场参数 ----
 BARS_30M_FOR_CHAN = 250        # 30分钟缠论分析所用K线根数（约31个交易日）
@@ -292,6 +309,11 @@ TRAIL_DRAWDOWN_RATIO = 0.08    # 触发阈值：现价 ≤ 最高水位 ×(1-8%)
 
 # ---- 中枢时效（P2修复：陈旧中枢不做位置过滤）----
 ZS_MAX_AGE = 60                # 最近中枢终点距今超过 N 根K线视为过期（日线/30分钟通用）
+
+# ---- v5：进取信号开关 ----
+# True → trend 模式启用"缠论二买/三买(顺势)+周线中枢上移"进取买点（买强势股回调），
+#   替代原 v4 的"30分底背驰抄底"。False → 退化为 v4 行为，便于 A/B 对照。
+AGGRESSIVE_BUY = True
 
 # 30分钟K线收盘时刻（沪深两市）。15:00收盘无法成交，故不纳入；
 # 仅在这些时刻做重量级缠论检测与下单/止损。
@@ -482,7 +504,7 @@ def is_monthly_trend_up(security, context):
     月线趋势向下时出现的底背驰，多为下跌中继的反弹（危险买点），必须放弃。
     盘前对候选池预先计算，盘中直接信任（月线日内不变）。"""
     try:
-        mdf = get_bars(security, count=12, unit='1M', fields=['close'], include_now=True)
+        mdf = get_bars(security, count=12, unit='1M', fields=['close'], include_now=False)
         if mdf is None or len(mdf) < 10:
             return False   # 数据不足按不安全处理
         closes = np.asarray(mdf['close'], dtype=float)
@@ -526,6 +548,93 @@ def daily_buy_point_confirmed(security):
     if zg is None or close[-1] > zg:
         return False, None
     return True, sig_low
+
+
+def is_weekly_rising(security, context):
+    """v5 进取版·周线"中枢上移"判定（多级别上升结构过滤）：
+    取周线K线→笔→中枢，要求：① 存在≥2个中枢；② 最近中枢ZG > 前一中枢ZG
+    （中枢上移，缠论"走势必完美"中的上升结构）；③ 现价站在最近中枢ZG上方
+    （上升段进行中，非已跌破）。满足→该股处于周线级上升走势，才允许用30分钟
+    二买/三买"买强势回调"。这是把 v4 的"抄底弱势股"翻转为"买强势股回踩"的关键闸。
+    盘前对 trend 候选池计算，盘中信任（周线日内不变）。"""
+    try:
+        bars = get_bars(security, count=BARS_WEEK_FOR_CHAN, unit='1w',
+                        fields=['high', 'low', 'close'], include_now=False)
+    except Exception as e:
+        log.warn("周线数据获取失败 %s: %s" % (security, e))
+        return False
+    if bars is None or len(bars) < 60:
+        return False
+    high = np.asarray(bars['high'], dtype=float)
+    low = np.asarray(bars['low'], dtype=float)
+    close = np.asarray(bars['close'], dtype=float)
+    bi = _bi_list(high, low)
+    if len(bi) < 5:
+        return False
+    zsl = _zhongshu_from_bi(bi)
+    if len(zsl) < 2:
+        return False
+    zg_last, zg_prev = zsl[-1][2], zsl[-2][2]
+    if zg_last <= zg_prev:
+        return False          # 中枢未上移 → 非上升结构
+    if close[-1] <= zg_last:
+        return False          # 现价未站上最近中枢上沿 → 不在上升段
+    return True
+
+
+def detect_aggressive_buy(high, low, close, recent_bars=3, zs_max_age=ZS_MAX_AGE):
+    """v5 进取版·缠论二买/三买(顺势)检测。返回 (signal, kind, zg, zd, sig_low)。
+    kind ∈ {'2nd' 二类买点, '3rd' 三类买点}。与 detect_beichi_signal(底背驰=一类,
+    抄底反转)互补：这里是"顺势/回调买"，抓的是已确认强势股的回踩，而非弱势股接刀。
+      - 三买(3rd)：存在有效中枢[ZD,ZG]；中枢后一笔向上突破(ZG上方新高)，随后一笔
+            向下回踩但低点≥ZG(不进中枢)，且该回踩下降笔新鲜→顺势追涨买点。
+      - 二买(2nd)：最近一类买点(底背驰)低点L1后回升一笔，再回落一笔低点>L1
+            (不破一类低点，确认反转有效)且回落笔新鲜→更安全再入场买点。
+    无信号返回 (None,None,None,None,None)。sig_low 作为结构止损参考位
+    （跌破二买/三买低点=结构证伪）。"""
+    bi = _bi_list(high, low)
+    if len(bi) < 5:
+        return None, None, None, None, None
+    n = len(close)
+    zsl = _zhongshu_from_bi(bi)
+    last_zg, last_zd = None, None
+    if zsl:
+        zs = zsl[-1]
+        if (n - 1 - zs[1]) <= zs_max_age:
+            last_zg, last_zd = zs[2], zs[3]
+
+    # ---- 三买：中枢后突破→回踩不进中枢 ----
+    if last_zg is not None:
+        later = [b for b in bi if b[0] >= zs[1]]
+        up = None
+        for b in later:
+            if b[2] == 1 and b[4] > last_zg:
+                up = b
+                break
+        if up is not None:
+            down = None
+            for b in later:
+                if b[0] > up[0] and b[2] == -1 and b[4] >= last_zg:
+                    down = b   # 回踩低点≥ZG(不进中枢) → 三买
+            if down is not None and down[1] >= n - recent_bars:
+                return 'buy', '3rd', last_zg, last_zd, down[4]
+
+    # ---- 二买：一类低点L1后回升→回落不破L1 ----
+    hist = _macd_hist(close)
+    cur, prev = bi[-1], bi[-3]
+    l1 = None
+    if cur[2] == -1 and cur[1] >= n - recent_bars * 3:
+        area_cur = abs(np.nansum(hist[cur[0]:cur[1] + 1]))
+        area_prev = abs(np.nansum(hist[prev[0]:prev[1] + 1]))
+        if area_prev > 0 and cur[4] < prev[4] and area_cur < area_prev:
+            l1 = cur[4]   # 一类买点(底背驰)低点
+    if l1 is not None:
+        after = [b for b in bi if b[0] > cur[0]]
+        if len(after) >= 2 and after[0][2] == 1:
+            down2 = after[1]
+            if down2[2] == -1 and down2[4] > l1 and down2[1] >= n - recent_bars:
+                return 'buy', '2nd', last_zg, last_zd, down2[4]
+    return None, None, None, None, None
 
 
 # ======================================================================
@@ -829,6 +938,13 @@ def before_market_open(context):
         if not is_monthly_trend_up(stock, context):
             continue
 
+        # --- v5 进取闸：trend 模式额外要求周线"中枢上移"（多级别上升结构）---
+        # 把 trend 候选从"任意月多头"收窄到"周线级上升走势的强势股"，使盘中
+        # 30分二买/三买变成"买强势回调"，而非"抄底弱势"（即 v4 底背驰的缺陷）。
+        # range 模式不做此闸（range 用原防御逻辑，不追强势）。
+        if is_trend and AGGRESSIVE_BUY and not is_weekly_rising(stock, context):
+            continue
+
         # --- 第3闸·日线缠论买点确认（P1修复核心：日线定买点）---
         # 只有日线级别底背驰近5日内成立 + 中枢下方，才值得盘中用
         # 30分钟去找精确入场。这一道闸把候选池压到极小（性能关键）。
@@ -990,7 +1106,7 @@ def market_intraday(context):
                 continue
             data = current_data[security]
             if data.last_price > data.low_limit:
-                hist_20d = get_bars(security, count=20, unit='1d', fields=['close'], include_now=True)
+                hist_20d = get_bars(security, count=20, unit='1d', fields=['close'], include_now=False)
                 if len(hist_20d) < 20:
                     continue
                 ma20 = hist_20d['close'].mean()
@@ -1086,33 +1202,35 @@ def _check_stop_loss(context, current_data, current_date):
         should_sell = False
         reason = ""
 
-        if g.active_mode == 'trend':
-            # ---- trend 模式止损（= v2.0：-5%硬 + 跌破MA20 + 均线转弱）----
-            # 趋势市用均线顺势止损：趋势一弱即走、躲深调；不用结构止损/棘轮。
-            should_sell, reason = _ma_stop_triggered(security, current_price, total_pnl_ratio)
+        # ---- 止损分支：有结构止损位(stop_ref)→结构止损+刚性+棘轮；无→MA止损 ----
+        # v5：stop_ref 在两种情况下存在——① range 模式底背驰买；② trend 模式进取买
+        #   (二买/三买低点)。两者都走"结构止损"路径（跌破买入信号低点=结构证伪），
+        #   这是缠论最自然的退出，也是对"进取"仓位的硬约束。
+        #   无 stop_ref 的情况——trend 模式底背驰买(AGGRESSIVE_BUY=False 退化)或
+        #   跨模式遗留仓→回退 MA 均线止损兜底（v2 风格）。
+        stop_ref = g.stop_ref_dict.get(security)
+        if stop_ref is not None:
+            # a) 结构止损（主力）：跌破30分钟买点信号笔低点（背驰/二买/三买证伪）。
+            #    入场前已保证触发价距买入价 ≤ MAX_STOP_DISTANCE，故正常破位
+            #    一定是它先于刚性线触发。
+            if current_price < stop_ref * (1.0 - STRUCT_STOP_BUFFER):
+                should_sell = True
+                reason = "跌破信号笔低点 %.2f（结构止损·证伪）" % stop_ref
+            # b) 刚性止损：-8% 纯灾难兜底（隔夜跳空/极端行情）
+            elif total_pnl_ratio <= HARD_STOP_RATIO:
+                should_sell = True
+                reason = "触及 %.0f%% 刚性止损线（灾难兜底）" % (HARD_STOP_RATIO * 100)
+            # c) 利润棘轮：浮盈曾达激活线后，从最高水位回撤超阈值 → 锁定利润
+            elif hwm >= my_cost * (1.0 + TRAIL_ACTIVATE_RATIO) \
+                    and current_price <= hwm * (1.0 - TRAIL_DRAWDOWN_RATIO):
+                should_sell = True
+                reason = "利润棘轮止盈：最高 %.2f(+%.1f%%) 回撤%.0f%%" \
+                         % (hwm, (hwm - my_cost) / my_cost * 100, TRAIL_DRAWDOWN_RATIO * 100)
         else:
-            # ---- range 模式止损（= v3.3：结构止损 + -8%刚性 + 利润棘轮）----
-            stop_ref = g.stop_ref_dict.get(security)
-            if stop_ref is None:
-                # 跨模式遗留：trend 模式建的仓无结构止损位 → 回退 MA 止损兜底
-                should_sell, reason = _ma_stop_triggered(security, current_price, total_pnl_ratio)
-            else:
-                # a) 结构止损（主力）：跌破30分钟买点信号笔低点（背驰证伪）。
-                #    入场前已保证触发价距买入价 ≤ MAX_STOP_DISTANCE，故正常破位
-                #    一定是它先于刚性线触发。
-                if current_price < stop_ref * (1.0 - STRUCT_STOP_BUFFER):
-                    should_sell = True
-                    reason = "跌破信号笔低点 %.2f（背驰证伪·结构止损）" % stop_ref
-                # b) 刚性止损：-8% 纯灾难兜底（隔夜跳空/极端行情/无stop_ref异常态）
-                elif total_pnl_ratio <= HARD_STOP_RATIO:
-                    should_sell = True
-                    reason = "触及 %.0f%% 刚性止损线（灾难兜底）" % (HARD_STOP_RATIO * 100)
-                # c) 利润棘轮：浮盈曾达激活线后，从最高水位回撤超阈值 → 锁定利润
-                elif hwm >= my_cost * (1.0 + TRAIL_ACTIVATE_RATIO) \
-                        and current_price <= hwm * (1.0 - TRAIL_DRAWDOWN_RATIO):
-                    should_sell = True
-                    reason = "利润棘轮止盈：最高 %.2f(+%.1f%%) 回撤%.0f%%" \
-                             % (hwm, (hwm - my_cost) / my_cost * 100, TRAIL_DRAWDOWN_RATIO * 100)
+            # ---- MA 均线止损（= v2.0：-5%硬 + 跌破MA20 + 均线转弱）----
+            # 趋势市无结构止损位的仓（底背驰买/跨模式遗留）用均线顺势止损：
+            # 趋势一弱即走、躲深调。
+            should_sell, reason = _ma_stop_triggered(security, current_price, total_pnl_ratio)
 
         if should_sell:
             log.warn("🚨【风控卖出】%s 原因: %s，当前盈亏 %.2f%%"
@@ -1226,12 +1344,20 @@ def _process_30m_signals(context, current_data, current_date):
         close = np.asarray(bars['close'], dtype=float)
 
         fresh_buy = TREND_INTRADAY_FRESH if g.active_mode == 'trend' else INTRADAY_FRESH_BARS
-        sig, zg, zd, sig_low = detect_beichi_signal(high, low, close,
-                                                    recent_bars=fresh_buy)
+        # v5：trend 模式且开启进取 → 用二买/三买(顺势回调)；否则用底背驰(一类，抄底)
+        if g.active_mode == 'trend' and AGGRESSIVE_BUY:
+            sig, kind, zg, zd, sig_low = detect_aggressive_buy(high, low, close,
+                                                               recent_bars=fresh_buy)
+            use_aggr = True
+        else:
+            sig, zg, zd, sig_low = detect_beichi_signal(high, low, close,
+                                                        recent_bars=fresh_buy)
+            use_aggr = False
+            kind = '1st'
         if sig != 'buy':
             continue
-        # 中枢位置过滤：v4 trend 模式 fail-open（zg非None且价>ZG才拒，无中枢放行）；
-        #   range 模式 fail-closed（zg为None或价>ZG都拒，看不清结构不买）。
+        # 中枢位置过滤：trend 模式 fail-open（无中枢放行；有中枢且价>ZG才拒）；
+        #   range 模式 fail-closed（无中枢或价>ZG都拒，看不清结构不买）。
         if g.active_mode == 'trend':
             if zg is not None and close[-1] > zg:
                 continue
@@ -1246,17 +1372,18 @@ def _process_30m_signals(context, current_data, current_date):
         if current_price >= current_data[stock].high_limit:
             continue
 
-        # v4：range 模式入场前风险过滤——结构止损触发价距买入价 ≤ MAX_STOP_DISTANCE，
-        #   止损太远不做（控制单笔风险 + 保证结构止损先于-8%刚性触发）。
-        #   trend 模式不用结构止损，跳过此检查（sig_low 仍随信号返回但 trend 不存不用）。
-        if g.active_mode != 'trend':
+        # 入场前风险过滤：结构止损触发价距买入价 ≤ MAX_STOP_DISTANCE（控制单笔风险）。
+        #   range 买 与 trend 进取买(二买/三买)都须做（保证结构止损先于刚性触发，
+        #   且二买/三买低点可能离现价较远，需确认风险可控）；trend 底背驰买
+        #   (退化/无stop_ref)跳过，改用 MA 止损。
+        if use_aggr or g.active_mode != 'trend':
             if sig_low is None:
                 continue
             struct_trigger = sig_low * (1.0 - STRUCT_STOP_BUFFER)
             if struct_trigger < current_price * (1.0 - MAX_STOP_DISTANCE):
                 continue  # 结构位距现价 >5%，单笔风险过大，放弃该信号
 
-        triggered_stocks.append((stock, current_price, sig_low))
+        triggered_stocks.append((stock, current_price, sig_low, use_aggr, kind))
 
     # 【建仓】v4：trend 模式等权(budget/n，封顶 MAX_TRADE_VALUE 分单) / range 模式比例仓位(总资产×PER_STOCK_MAX_RATIO)
     #   用 spent 本地累计，规避 available_cash 在同一bar内可能滞后更新。
@@ -1272,7 +1399,7 @@ def _process_30m_signals(context, current_data, current_date):
         per_stock_cap = min(trend_eq, trend_cap) if is_trend \
                         else (context.portfolio.total_value * PER_STOCK_MAX_RATIO)
         spent = 0.0
-        for stock, current_price, sig_low in triggered_stocks:
+        for stock, current_price, sig_low, use_aggr, kind in triggered_stocks:
             if g.today_buy_count >= MAX_BUYS_PER_DAY:
                 break
             remaining = buy_budget - spent           # 本批剩余可用预算
@@ -1286,13 +1413,23 @@ def _process_30m_signals(context, current_data, current_date):
                 g.position_lock_stocks.add(stock)
                 g.today_buy_count += 1
                 g.candidate_pool.discard(stock)
-                if is_trend:
-                    # trend 模式：不存结构止损位/棘轮水位（止损改用 MA 均线）
+                if use_aggr:
+                    # v5 进取买(二买/三买)：存结构止损位(二买/三买低点)+棘轮水位起点。
+                    #   stop_ref 存在 → _check_stop_loss 走结构止损路径（跌破=结构证伪）。
+                    g.stop_ref_dict[stock] = sig_low
+                    g.high_watermark_dict[stock] = current_price
+                    log.info("🛒【trend·进取·%s买】%s 周线中枢上移+月多头+30分%s，现价 %.2f 买入 %d 股(≈%.0f元/等权%d只)，结构止损位 %.2f（距价%.1f%%）"
+                             % (kind, stock, ('三买' if kind == '3rd' else '二买'),
+                                current_price, ordered_amount,
+                                ordered_amount * current_price, n,
+                                sig_low, (current_price - sig_low) / current_price * 100))
+                elif is_trend:
+                    # trend 退化买(AGGRESSIVE_BUY=False)：不存结构止损位（止损改用 MA 均线）
                     log.info("🛒【trend·30分背驰直买】%s 月多头+30分底背驰，现价 %.2f 买入 %d 股(≈%.0f元/等权%d只)"
                              % (stock, current_price, ordered_amount,
                                 ordered_amount * current_price, n))
                 else:
-                    # range 模式：存结构止损位(只用30分信号笔低点) + 利润棘轮水位起点
+                    # range 模式：存结构止损位(30分信号笔低点) + 利润棘轮水位起点
                     g.stop_ref_dict[stock] = sig_low
                     g.high_watermark_dict[stock] = current_price
                     log.info("🛒【range·30分背驰直买】%s 月多头+日线买点+30分底背驰+有效中枢下方，"
