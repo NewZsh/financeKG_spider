@@ -32,6 +32,11 @@
 
 2. Trend
 
+- 趋势，一定要在有趋势的市场才能使用。横向趋势、或者说没有趋势的时候，一定不要交易。
+
+![Trend](1.jpg)
+
+
 
 - Dow Theory
 
@@ -46,6 +51,29 @@
       - 注意：量是第二位的，道氏理论仍然以收市价格为B/S信号
     - A trend is assumed to be in effect until it gives definite signals that it has reversed.
 
+- support & resistance
+
+  - support: troughs (or reaction lows), where buying interest is strong enough to overcome selling pressure.
+  - resistance: peaks (or reaction highs), where selling interest is strong enough to overcome buying pressure.
+  - TREND:
+    - for an **uptrend**, each successive trough should be higher than the previous trough, and each successive peak should be higher than the previous peak.
+    - for a **downtrend**, each successive peak should be lower than the previous peak, and each successive trough should be lower than the previous trough.
+  - TREND reversal:
+    ![Trend](1-2.jpg)
+    ![Trend](1-3.jpg)
+  - how SUPPORT and RESISTANTCE reverse their roles
+    ![Trend](1-4.jpg)
+    ![Trend](1-5.jpg)
+  - Importance of support & resistance
+    - the amount of time spent there
+    - volume
+    - how recently the trading took place
+    - the distance prices traveled away from support or resistance increased the significance
+  - **round numbers** as support & resistance
+
+- trendlines
+  
+
 - 概念：
   - [做市商](learn_notes/1.做市商.md)。
-  - [MACD](learn_notes/2.MACD.md)
+  - [MACD KDJ RSI](learn_notes/2.MACD_KDJ_RSI.md)
