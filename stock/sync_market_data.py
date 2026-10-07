@@ -634,7 +634,7 @@ class MarketDataFetcher:
             ApiRateLimiter.wait("daily_bars")
             request_start = "" if is_bj_symbol else start_date
             request_end = "" if is_bj_symbol else current_end
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayqfq&param={symbol},day,{request_start},{request_end},{limit},{adjust_type}"
+            url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get?_var=kline_dayqfq&param={symbol},day,{request_start},{request_end},{limit},{adjust_type}"
             def do_fetch():
                 resp = SharedHttpClient.get(url, timeout=15)
                 if resp.status_code != 200:
@@ -712,7 +712,7 @@ class MarketDataFetcher:
             
         ApiRateLimiter.wait("intraday")
         symbol = to_symbol(code)
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}"
+        url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/minute/query?code={symbol}"
         def do_fetch():
             resp = SharedHttpClient.get(url, timeout=15)
             if resp.status_code != 200:
@@ -795,7 +795,7 @@ class MarketDataFetcher:
 
         ApiRateLimiter.wait("intraday")
         symbol = to_symbol(code)
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/day/query?code={symbol}"
+        url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/day/query?code={symbol}"
 
         def do_fetch():
             resp = SharedHttpClient.get(url, timeout=15)
