@@ -1,8 +1,18 @@
 ﻿# -*- coding: utf-8 -*-
 """
-绛栫暐鍚嶇О锛?涓绘澘寮哄娍鑲♀€滃洜瀛愭墦鍒?- 娲楃洏纭 - 鐩樹腑涓婄牬鏄ㄥ紑鍗充粙鍏モ€濈煭绾跨瓥鐣?
-璁捐鐩爣锛?1. 淇濈暀 s1.py 宸查獙璇佺殑鎵ц灞備笌椋庢帶灞傝兘鍔涖€?2. 灏嗙洏鍓嶇獊鐮存壂鎻忔敼閫犳垚鈥滃洜瀛愬揩鐓?-> 杩炵画鎵撳垎 -> Top-N 鍏ユ睜鈥濈殑淇″彿灞傘€?3. 鍦ㄥ畬鏁村洜瀛愮爺绌舵鏋惰惤鍦板墠锛屽厛鐢ㄥ彲瑙ｉ噴鐨勭嚎鎬у姞鏉冪増鏈浛浠ｅ竷灏旇鍒欏爢鍙犮€?
-璇存槑锛?- 鏈剼鏈槸 plan.md 涓€滈樁娈?4: 鎵ц灞傛帴绠♀€濈殑绗竴鐗堝疄鐜般€?- 浠嶇劧淇濈暀蹇呰鐨勪氦鏄撴姢鏍忥紝閬垮厤淇″彿灞傚皻鏈绾挎牎楠屽墠杩囧害鏀惧鑲＄エ姹犮€?"""
+策略名称：
+主板强势股“因子打分 - 洗盘确认 - 盘中上破昨开介入”短线策略（s4）
+
+设计目标：
+1. 保留 s1.py 已验证的执行层与风控层能力，例如主板池过滤、观察池、死磕补卖池、持仓锁等。
+2. 将盘前的“突破扫描”升级为“因子快照 -> 连续打分 -> Top-N 入池”的信号层。
+3. 在完整因子研究框架落地前，先用可解释的线性加权版本替代原先的布尔规则堆叠。
+
+说明：
+- 本脚本对应 plan.md 中“执行层接管”的首版实现。
+- 当前重点是把“选什么、为什么选”从硬编码规则迁移到可监控的因子体系。
+- 执行与风控仍沿用 s1.py 的成熟护栏，避免在信号层尚未充分验证前过度放宽股票池。
+"""
 
 import numpy as np
 import pandas as pd
@@ -24,6 +34,7 @@ FACTOR_MONITOR_MIN_SAMPLE_SIZE = 20
 FACTOR_MONITOR_MIN_OBSERVATIONS = 12
 FACTOR_MONITOR_MAX_HISTORY = 90
 FACTOR_MONITOR_CANDIDATE_CAP = 120
+FACTOR_MONITOR_MAX_RETRY_DAYS = 5
 
 FACTOR_STATUS_RULES = {
 	'disable_ic_mean': 0.01,
@@ -102,6 +113,18 @@ FACTOR_LIBRARY = {
 		'lower': -0.02,
 		'upper': 0.12,
 	},
+	'box_range_ratio_20d': {
+		'family': 'volatility',
+		'base_weight': 0.06,
+		'lower': 0.80,
+		'upper': 0.98,
+	},
+	'box_breakout_strength_20d': {
+		'family': 'momentum',
+		'base_weight': 0.07,
+		'lower': -0.02,
+		'upper': 0.10,
+	},
 	'volatility_contraction': {
 		'family': 'volatility',
 		'base_weight': 0.07,
@@ -152,6 +175,8 @@ FACTOR_RESEARCH_STATUS = {
 	'reclaim_open_strength': {'ic_mean': 0.042, 'icir': 0.67, 'monotonicity_break_rate': 0.14},
 	'alpha101_101_like': {'ic_mean': 0.033, 'icir': 0.44, 'monotonicity_break_rate': 0.22},
 	'breakout_distance_20d': {'ic_mean': 0.027, 'icir': 0.36, 'monotonicity_break_rate': 0.24},
+	'box_range_ratio_20d': {'ic_mean': 0.022, 'icir': 0.35, 'monotonicity_break_rate': 0.21},
+	'box_breakout_strength_20d': {'ic_mean': 0.030, 'icir': 0.46, 'monotonicity_break_rate': 0.19},
 	'volatility_contraction': {'ic_mean': 0.024, 'icir': 0.33, 'monotonicity_break_rate': 0.21},
 	'alpha101_014_like': {'ic_mean': 0.018, 'icir': 0.22, 'monotonicity_break_rate': 0.31},
 }
@@ -235,6 +260,21 @@ def corr_last(series_a, series_b, window):
 	return float(value)
 
 
+def format_top_factor_contributors(factor_breakdown, limit=3):
+	if not factor_breakdown:
+		return 'n/a'
+
+	ranked_items = sorted(
+		factor_breakdown.items(),
+		key=lambda item: item[1].get('contribution', 0.0),
+		reverse=True,
+	)
+	parts = []
+	for factor_name, factor_info in ranked_items[:limit]:
+		parts.append(f"{factor_name}={factor_info.get('contribution', 0.0):.2f}")
+	return ', '.join(parts)
+
+
 def sanitize_factor_value(value):
 	if value is None:
 		return 0.0
@@ -288,6 +328,8 @@ def build_feature_store(df):
 		'ma10': float(close_series.iloc[-10:].mean()),
 		'ma20': float(close_series.iloc[-20:].mean()),
 		'max20': float(close_series.iloc[-20:].max()),
+		'prev20_high': float(high_series.iloc[-21:-1].max()) if len(high_series) >= 21 else float(high_series.iloc[-20:].max()),
+		'prev20_low': float(low_series.iloc[-21:-1].min()) if len(low_series) >= 21 else float(low_series.iloc[-20:].min()),
 		'max3_open': float(open_series.iloc[-3:].max()),
 		'vol_mean_22': float(volume_series.iloc[-22:-1].mean()) if len(volume_series) >= 22 else 0.0,
 		'vol_std_22': float(volume_series.iloc[-22:-1].std()) if len(volume_series) >= 22 else 0.0,
@@ -358,6 +400,16 @@ def factor_alpha101_101_like(features):
 @register_factor_compute('breakout_distance_20d')
 def factor_breakout_distance_20d(features):
 	return safe_divide(features['last_close'], features['max20'], default=1.0) - 1 if features['max20'] > 0 else 0.0
+
+
+@register_factor_compute('box_range_ratio_20d')
+def factor_box_range_ratio_20d(features):
+	return safe_divide(features['prev20_low'], features['prev20_high'], default=0.0)
+
+
+@register_factor_compute('box_breakout_strength_20d')
+def factor_box_breakout_strength_20d(features):
+	return safe_divide(features['last_close'], features['prev20_high'], default=1.0) - 1 if features['prev20_high'] > 0 else 0.0
 
 
 @register_factor_compute('volatility_contraction')
@@ -475,6 +527,7 @@ def register_factor_monitor_snapshot(current_date, candidate_rows):
 		'day_index': g.trading_day_index,
 		'as_of_date': str(current_date),
 		'rows': monitor_rows,
+		'retry_days': 0,
 	})
 	g.factor_monitor_pending = g.factor_monitor_pending[-FACTOR_MONITOR_MAX_HISTORY:]
 
@@ -508,6 +561,14 @@ def evaluate_factor_monitor_snapshots(context):
 			})
 
 		if len(valid_rows) < FACTOR_MONITOR_MIN_SAMPLE_SIZE:
+			snapshot['retry_days'] = int(snapshot.get('retry_days', 0)) + 1
+			if snapshot['retry_days'] <= FACTOR_MONITOR_MAX_RETRY_DAYS:
+				remaining_snapshots.append(snapshot)
+			else:
+				log.warn(
+					f"因子监控样本不足，放弃快照 -> as_of={snapshot.get('as_of_date')}, "
+					f"sample_size={len(valid_rows)}, retries={snapshot['retry_days']}"
+				)
 			continue
 
 		for factor_name in FACTOR_LIBRARY.keys():
@@ -530,7 +591,7 @@ def evaluate_factor_monitor_snapshots(context):
 
 	g.factor_monitor_pending = remaining_snapshots
 	if evaluated_snapshot_count > 0:
-		log.info(f"馃搱 鍥犲瓙鐩戞帶鏇存柊瀹屾垚 -> evaluated_snapshots={evaluated_snapshot_count}")
+		log.info(f"因子监控更新完成 -> evaluated_snapshots={evaluated_snapshot_count}")
 
 
 def blend_factor_metrics(factor_name):
@@ -646,7 +707,7 @@ def emit_factor_effectiveness_report(context):
 		'rows': report_rows,
 	}
 
-	log.info(f"馃搳 鍥犲瓙鏈堝害鎶ュ憡 -> date={current_date}, regime={g.current_regime}")
+	log.info(f"因子月度报告 -> date={current_date}, regime={g.current_regime}")
 	for row in report_rows[:5]:
 		log.info(
 			f"TOP factor={row['factor_name']} status={row['status']} ic={row['ic_mean']:.4f} "
@@ -667,7 +728,7 @@ def refresh_factor_effectiveness_state(context):
 	for state in g.factor_runtime_state.values():
 		status_counter[state['status']] += 1
 	log.info(
-		f"馃И 鍥犲瓙鐘舵€佸埛鏂?-> active={status_counter['active']}, "
+		f"因子状态刷新 -> active={status_counter['active']}, "
 		f"warning={status_counter['warning']}, disabled={status_counter['disabled']}"
 	)
 
@@ -683,6 +744,7 @@ def compute_factor_snapshot(df):
 	factor_values = compute_registered_factors(features)
 	realized_vol_ratio = safe_divide(features['recent_vol_5'], features['recent_vol_20'], default=0.0)
 	breakout_price = max(features['last_open'], features['last_close'])
+	box_amplitude_20d = safe_divide(features['prev20_high'] - features['prev20_low'], features['prev20_low'], default=0.0)
 
 	return {
 		'last_close': features['last_close'],
@@ -696,6 +758,7 @@ def compute_factor_snapshot(df):
 		'ma10': features['ma10'],
 		'ma20': features['ma20'],
 		'realized_vol_ratio': realized_vol_ratio,
+		'box_amplitude_20d': box_amplitude_20d,
 		'breakout_price': breakout_price,
 		'factor_values': factor_values,
 	}
@@ -705,16 +768,11 @@ def passes_signal_guard(snapshot, factor_state):
 	if snapshot is None:
 		return False
 
-	factor_values = snapshot['factor_values']
-	trend_ok = snapshot['last_close'] > snapshot['ma5'] > snapshot['ma10']
-	price_ok = (
-		factor_values['day_return_intraday'] > 0.02
-		or factor_values['day_return_overnight'] > 0.02
-	)
-	volume_ok = factor_values['vol_zscore_22d'] > 0.3 and snapshot['last_volume'] > snapshot['prev_volume']
-	stability_ok = snapshot['realized_vol_ratio'] < 2.8 if snapshot['realized_vol_ratio'] > 0 else True
+	price_ok = snapshot['last_close'] > 0 and snapshot['prev_close'] > 0
+	volume_ok = snapshot['last_volume'] > 0 and snapshot['prev_volume'] > 0
+	stability_ok = snapshot['realized_vol_ratio'] < 3.5 if snapshot['realized_vol_ratio'] > 0 else True
 	active_factor_count = sum(1 for state in factor_state.values() if state['status'] != 'disabled')
-	return trend_ok and price_ok and volume_ok and stability_ok and active_factor_count >= MIN_ACTIVE_FACTORS
+	return price_ok and volume_ok and stability_ok and active_factor_count >= MIN_ACTIVE_FACTORS
 
 
 def compute_signal_payload(snapshot, regime, factor_state):
@@ -773,6 +831,7 @@ def build_watch_pool_entry(current_date, snapshot, signal_payload, regime):
 		'breakout_date': current_date,
 		'max_raise_vol': snapshot['last_volume'],
 		'breakout_price': snapshot['breakout_price'],
+		'latest_breakout_price': snapshot['breakout_price'],
 		'age': 0,
 		'max_drop_vol': 0.0,
 		'signal_score': signal_payload['signal_score'],
@@ -804,7 +863,7 @@ def refresh_watch_pool_score(info, regime, factor_state):
 def initialize(context):
 	set_benchmark('000300.XSHG')
 	set_option('use_real_price', True)
-	log.info('銆愬洜瀛愪俊鍙风増鏈?s2銆戝惎鍔?..')
+	log.info('【因子信号版本 s4】启动...')
 
 	set_order_cost(
 		OrderCost(
@@ -855,7 +914,7 @@ def get_main_board_pool(context):
 		if stock.startswith('300') or stock.startswith('301') or stock.startswith('688') or stock.startswith('8') or stock.startswith('4'):
 			continue
 
-		if current_data[stock].is_st or 'ST' in current_data[stock].name or '閫€' in current_data[stock].name:
+		if current_data[stock].is_st or 'ST' in current_data[stock].name or '退' in current_data[stock].name:
 			continue
 
 		if current_data[stock].paused:
@@ -880,7 +939,7 @@ def before_market_open(context):
 
 	if g.freeze_days_left > 0:
 		g.freeze_days_left -= 1
-		log.warn(f"馃毃 绛栫暐澶勪簬鏁翠綋浜忔崯鐔旀柇淇濇姢涓紝鍓╀綑 {g.freeze_days_left} 澶╀笉杩涜浠讳綍涔板叆銆?)
+		log.warn(f"策略处于整体亏损熔断保护中，剩余 {g.freeze_days_left} 天不进行任何买入。")
 		return
 
 	for stock in list(g.blacklist_dict.keys()):
@@ -903,9 +962,9 @@ def before_market_open(context):
 	for stock in list(g.watch_pool.keys()):
 		info = g.watch_pool[stock]
 
-		if current_data_watch[stock].is_st or 'ST' in current_data_watch[stock].name or '閫€' in current_data_watch[stock].name:
+		if current_data_watch[stock].is_st or 'ST' in current_data_watch[stock].name or '退' in current_data_watch[stock].name:
 			del g.watch_pool[stock]
-			log.info(f"馃棏锔?瑙傚療姹犳窐姹?ST/閫€甯傝偂 -> {stock}")
+			log.info(f"观察池淘汰 ST/退市风险股票 -> {stock}")
 			continue
 
 		info['age'] += 1
@@ -943,7 +1002,7 @@ def before_market_open(context):
 			continue
 
 		info['factor_snapshot'] = refreshed_snapshot
-		info['breakout_price'] = max(info.get('breakout_price', 0.0), refreshed_snapshot['breakout_price'])
+		info['latest_breakout_price'] = refreshed_snapshot['breakout_price']
 		refresh_watch_pool_score(info, g.current_regime, g.factor_runtime_state)
 		if info['signal_score'] < SIGNAL_ENTRY_FLOOR:
 			del g.watch_pool[stock]
@@ -977,10 +1036,16 @@ def before_market_open(context):
 			g.watch_pool[stock] = build_watch_pool_entry(current_date, snapshot, signal_payload, g.current_regime)
 			family_scores = signal_payload['family_scores']
 			log.info(
-				f"馃幆 鍥犲瓙娉ㄥ叆瑙傚療姹?-> {stock} "
+				f"因子注入观察池 -> {stock} "
 				f"(regime={g.current_regime}, score={signal_score:.2f}, "
 				f"trend={family_scores.get('trend', 0.0):.2f}, momentum={family_scores.get('momentum', 0.0):.2f}, "
 				f"volume={family_scores.get('volume', 0.0):.2f}, reversal={family_scores.get('reversal', 0.0):.2f})"
+			)
+		for rank, (signal_score, stock, snapshot, signal_payload) in enumerate(candidates[:min(5, available_slots)], start=1):
+			log.info(
+				f"候选摘要 rank={rank} stock={stock} score={signal_score:.2f} "
+				f"box_amp={snapshot.get('box_amplitude_20d', 0.0):.3f} "
+				f"top_factors={format_top_factor_contributors(signal_payload.get('factor_breakdown', {}))}"
 			)
 
 	index_data = get_bars('000300.XSHG', count=60, unit='1d', fields=['close'], include_now=False)
@@ -1012,7 +1077,7 @@ def market_open(context):
 				pos = context.portfolio.positions[security]
 				amount = pos.closeable_amount
 				if amount > 0:
-					log.warn(f"馃洃 娆℃棩寮€鐩樺己鍒舵竻浠?鏃犳棩绾跨‘璁? -> {security} , 鍗栧嚭鏁伴噺: {amount}")
+					log.warn(f"次日开盘强制清仓（前一日盘中买入未获日线确认） -> {security}, amount={amount}")
 					order_amount_in_chunks(security, -amount, None)
 					g.trailing_stop_last_date[security] = current_date
 			g.next_open_forced_sell.discard(security)
@@ -1027,7 +1092,7 @@ def market_open(context):
 
 			amount = pos.closeable_amount
 			if amount > 0:
-				log.error(f"鈿狅笍 [寮€鐩橀闄╂嫤鎴猐 鑲＄エ {security} 浠婃棩寮€鐩樺嵆璺屽仠锛佹寕璺屽仠浠烽檺浠峰崟鍗栧嚭 {amount} 鑲?..")
+				log.error(f"[开盘风险拦截] {security} 今日开盘即跌停，挂跌停价限价单卖出 {amount} 股。")
 				order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
 				g.trailing_stop_last_date[security] = current_date
 
@@ -1035,7 +1100,7 @@ def market_open(context):
 				g.pending_exit_stocks[security] = data.low_limit
 
 	if g.pending_exit_stocks:
-		log.warning(f"馃攧 [寰呰ˉ鍗栨睜鎵弿] 姝ｅ湪妫€鏌?{len(g.pending_exit_stocks)} 鍙巻鍙查攣姝绘爣鐨?..")
+		log.warning(f"[待补卖池扫描] 正在检查 {len(g.pending_exit_stocks)} 只历史锁死标的。")
 		for security in list(g.pending_exit_stocks.keys()):
 			if security not in context.portfolio.positions:
 				g.pending_exit_stocks.pop(security, None)
@@ -1050,18 +1115,18 @@ def market_open(context):
 			if data.day_open <= data.low_limit:
 				amount = pos.closeable_amount
 				if amount > 0:
-					log.error(f"馃幆 鑲＄エ {security} 浠婃棩渚濈劧璺屽仠寮€鐩樸€傜户缁寕璺屽仠浠烽檺浠峰崠鍗曪紝鏁伴噺: {amount}")
+					log.error(f"{security} 今日仍跌停开盘，继续挂跌停价限价单卖出，amount={amount}")
 					order_amount_in_chunks(security, -amount, data.low_limit, is_limit=True)
 					g.trailing_stop_last_date[security] = current_date
 			else:
-				log.info(f"鈩癸笍 鑲＄エ {security} 浠婃棩宸叉墦寮€璺屽仠寮€鐩橈紝灏嗚瀵熻嚦 14:57 鍐冲畾鏄惁鐣欐椿鍙?..")
+				log.info(f"{security} 今日已打开跌停开盘，观察至 14:57 再决定是否保留持仓。")
 
 	for security in list(context.portfolio.positions.keys()):
 		if security in g.pending_exit_stocks:
 			continue
-		if current_data[security].is_st or 'ST' in current_data[security].name or '閫€' in current_data[security].name:
+		if current_data[security].is_st or 'ST' in current_data[security].name or '退' in current_data[security].name:
 			amount = context.portfolio.positions[security].total_amount
-			log.error(f"鈿狅笍 鎸佷粨鑲?{security} 浠婃棩鍙樹负ST/閫€锛屽紑鐩樺己鍒舵竻浠擄紝鏁伴噺: {amount}")
+			log.error(f"持仓股票 {security} 今日变为 ST/退市风险，开盘强制清仓，amount={amount}")
 			reference_price = current_data[security].day_open or current_data[security].last_price
 			order_amount_in_chunks(security, -amount, reference_price)
 
@@ -1131,9 +1196,9 @@ def market_intraday(context):
 					if ordered_amount >= 100:
 						est_value = ordered_amount * current_price
 						log.info(
-							f"馃洅銆愮洏涓拱鍏ヨЕ鍙戙€憑stock} "
-							f"score={signal_score:.2f}, 褰撳墠浠?{current_price:.2f} 涓婄牬鏄ㄥ紑 {yesterday_open:.2f}锛?
-							f"璁″垝閲戦: {cash_per_stock:.2f}锛屽疄闄呭崟娆′拱鍏?{ordered_amount} 鑲★紝鍙傝€冨競鍊? {est_value:.2f}"
+							f"盘中买入触发 -> {stock} "
+							f"score={signal_score:.2f}, current={current_price:.2f}, yesterday_open={yesterday_open:.2f}, "
+							f"planned_cash={cash_per_stock:.2f}, ordered_amount={ordered_amount}, est_value={est_value:.2f}"
 						)
 						g.buy_cost_dict[stock] = current_price
 						g.max_pnl_dict[stock] = 0.0
@@ -1164,10 +1229,16 @@ def market_intraday(context):
 
 				locked_price = g.pending_exit_stocks[security]
 				if data.last_price >= locked_price and data.last_price >= ma20:
-					log.info(f"鉁?[閿佹鏀跺] {security} 褰撳墠浠?{data.last_price:.2f} 鎴愬姛鏀跺閿佹浠?{locked_price:.2f} 涓旂獊鐮?MA20({ma20:.2f})锛屽墧闄ゅ嚭琛ュ崠姹狅紝鎭㈠姝ｅ父鎸佷粨鐘舵€併€?)
+					log.info(
+						f"[锁死收复] {security} current={data.last_price:.2f}, "
+						f"locked={locked_price:.2f}, ma20={ma20:.2f}，移出补卖池并恢复正常持仓。"
+					)
 					g.pending_exit_stocks.pop(security, None)
 				else:
-					log.error(f"鉂?[閿佹鏈敹澶峕 {security} 14:57 鏈兘鏀跺閿佹浠?{locked_price:.2f} 鎴?MA20({ma20:.2f})锛岀珛鍗虫寕闄愪环鍗曟竻浠?..")
+					log.error(
+						f"[锁死未收复] {security} 14:57 未能收复 locked={locked_price:.2f} 或 MA20({ma20:.2f})，"
+						"立即挂限价单清仓。"
+					)
 					amount = context.portfolio.positions[security].closeable_amount
 					if amount > 0:
 						order_amount_in_chunks(security, -amount, data.last_price, is_limit=True)
@@ -1222,36 +1293,36 @@ def market_intraday(context):
 				if position.closeable_amount < 500:
 					sell_amount = position.closeable_amount
 					full_exit = True
-					reason = f"14:57鍒╂鼎鍥炴挙瑙﹀彂闃舵姝㈢泩锛屽墿浣欎粨浣嶄笉瓒?00鑲″叏閮ㄥ崠鍑?鏈€楂樻诞鐩?{max_pnl * 100:.2f}%)"
+					reason = f"14:57 利润回撤触发止盈，剩余仓位不足 500 股，直接清仓（最高浮盈 {max_pnl * 100:.2f}%）"
 				else:
 					sell_amount = int((position.closeable_amount / 2) // 100) * 100
 					if sell_amount <= 0:
 						sell_amount = position.closeable_amount
 						full_exit = True
-						reason = f"14:57鍒╂鼎鍥炴挙瑙﹀彂闃舵姝㈢泩锛屼粨浣嶄笉瓒充竴鎵嬫敼涓哄叏閮ㄥ崠鍑?鏈€楂樻诞鐩?{max_pnl * 100:.2f}%)"
+						reason = f"14:57 利润回撤触发止盈，仓位不足一手，改为全卖（最高浮盈 {max_pnl * 100:.2f}%）"
 					else:
-						reason = f"14:57鍒╂鼎鍥炴挙瑙﹀彂闃舵姝㈢泩锛屽厛鍗栧嚭鍗婁粨(鏈€楂樻诞鐩?{max_pnl * 100:.2f}%)"
+						reason = f"14:57 利润回撤触发止盈，先卖出半仓（最高浮盈 {max_pnl * 100:.2f}%）"
 		elif total_pnl_ratio <= -0.05:
 			should_sell = True
 			is_loss = True
 			sell_amount = position.closeable_amount
 			full_exit = True
-			reason = '瑙﹀強-5%鍒氭€ф鎹熺嚎'
+			reason = '触及 -5% 刚性止损线'
 		elif current_price < ma20:
 			should_sell = True
 			is_loss = True
 			sell_amount = position.closeable_amount
 			full_exit = True
-			reason = '14:57浠锋牸璺岀牬20鏃ュ潎绾?
+			reason = '14:57 价格跌破 MA20'
 		elif ma20 > ma5 or ma20 > ma10:
 			should_sell = True
 			is_loss = True
 			sell_amount = position.closeable_amount
 			full_exit = True
-			reason = f"MA20({ma20:.2f})>MA5({ma5:.2f})鎴朚A10({ma10:.2f})锛屽潎绾胯秼鍔胯浆寮?
+			reason = f"均线转弱: MA20({ma20:.2f}) > MA5({ma5:.2f}) 或 MA10({ma10:.2f})"
 
 		if should_sell:
-			log.warn(f"馃毃銆愮洏涓Е鍙戝崠鍑恒€戣偂绁? {security}, 鍘熷洜: {reason}锛屽綋鍓嶇泩浜? {total_pnl_ratio * 100:.2f}%")
+			log.warn(f"盘中触发卖出 -> {security}, reason={reason}, pnl={total_pnl_ratio * 100:.2f}%")
 			order_amount_in_chunks(security, -sell_amount, current_price)
 			g.trailing_stop_last_date[security] = current_date
 
@@ -1263,7 +1334,7 @@ def market_intraday(context):
 					g.consecutive_loss_count += 1
 					if g.consecutive_loss_count >= 5:
 						g.freeze_days_left = 8
-						log.error('馃挜馃挜馃挜 绛栫暐鏁翠綋杩炵画浜忔崯5娆★紝瑙﹀彂鐔旀柇淇濇姢锛岀┖浠撻潰澹?涓氦鏄撴棩锛?)
+						log.error('策略连续亏损 5 次，触发熔断保护，后续 8 个交易日不再开新仓。')
 				else:
 					g.consecutive_loss_count = 0
 
@@ -1289,8 +1360,11 @@ def after_market_close(context):
 					if security not in g.pending_exit_stocks:
 						current_data = get_current_data()
 						g.pending_exit_stocks[security] = current_data[security].low_limit
-						log.error(f"馃毃 [鏃ラ姝婚攣鎷︽埅] 鍙戠幇鎸佷粨鑲?{security} 浠婃棩瑙﹀彂甯歌鍑忎粨鍗存湭鑳界鍦猴紒鏀剁洏渚濈劧鏈夊疄浠撱€傝穼鍋滈攣姝讳环: {current_data[security].low_limit}")
-						log.error('璇ヨ偂宸茶寮鸿鎷栧叆銆愭瘡鏃ユ纾曡ˉ鍗曟睜銆戯紝鏄庢棩锛堝寘鍚笅鍛ㄤ竴锛夊紑鐩樼涓€鍒嗛挓鑷姩鎸夊競浠风户缁崠鍑猴紒')
+						log.error(
+							f"[日内死锁拦截] 发现持仓股 {security} 今日触发常规减仓但未能离场，"
+							f"收盘仍有实仓。跌停锁死价: {current_data[security].low_limit}"
+						)
+						log.error('该股票已被强制拖入【每日死磕补卖池】，次日开盘第一分钟继续按市价卖出。')
 
 	if getattr(g, 'intraday_unconfirmed_buys', None):
 		for stock in list(g.intraday_unconfirmed_buys):
@@ -1299,6 +1373,9 @@ def after_market_close(context):
 			today_close = hist['close'][-1]
 			if today_close < today_open:
 				g.next_open_forced_sell.add(stock)
-				log.warn(f"馃摑 鐩樺悗鍒ゅ畾锛歿stock} 浠婃棩鏀剁洏 {today_close:.2f} 浣庝簬寮€鐩?{today_open:.2f}锛屾鏃ュ紑鐩樺皢寮哄埗甯備环娓呬粨(鍥犵洏涓拱鍏ユ湭鑾风‘璁?銆?)
+				log.warn(
+					f"盘后判定未获确认 -> {stock} close={today_close:.2f} < open={today_open:.2f}，"
+					"次日开盘将强制市价清仓。"
+				)
 
 		g.intraday_unconfirmed_buys.clear()
